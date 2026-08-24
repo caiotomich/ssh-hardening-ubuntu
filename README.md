@@ -15,8 +15,6 @@ Written to clear the alerts typical VPS panel security scanners raise:
 | SSH protection should be enabled | `[sshd]` jail with `enabled = true` |
 | Aggressive mode recommended | `mode = aggressive` |
 
-*Documentação em português: [README.pt-BR.md](README.pt-BR.md)*
-
 ---
 
 ## Requirements
