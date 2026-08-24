@@ -16,6 +16,7 @@
 #   --only-fail2ban            so configura o fail2ban, nao toca no sshd
 #   --ssh-mode normal|aggressive   modo do filtro sshd (padrao: aggressive)
 #   --allow-ip "1.2.3.4 5.6.7.0/24"  IPs que o fail2ban nunca bane
+#   --disable-pam              UsePAM no (veja os riscos no README)
 #
 # O safety-net e a rede de protecao: agenda a restauracao automatica do
 # backup. Se voce testar o acesso e estiver tudo certo, cancele o timer
@@ -29,7 +30,8 @@ readonly OVERRIDE="${SSHD_CONFIG_D}/00-hardening.conf"
 readonly BACKUP_DIR="/root/ssh-backup-$(date +%Y%m%d-%H%M%S)"
 readonly TIMER_UNIT="ssh-hardening-rollback"
 
-readonly F2B_JAIL="/etc/fail2ban/jail.d/00-hardening.local"
+readonly F2B_JAIL="/etc/fail2ban/jail.local"
+readonly F2B_JAIL_OLD="/etc/fail2ban/jail.d/00-hardening.local"
 readonly F2B_LOCAL="/etc/fail2ban/fail2ban.local"
 
 DRY_RUN=0
@@ -39,6 +41,7 @@ SKIP_F2B=0
 ONLY_F2B=0
 SSH_MODE="aggressive"
 ALLOW_IP=""
+PAM_VALUE="yes"
 
 # ---------- saida ----------
 c_red=$'\033[0;31m'; c_grn=$'\033[0;32m'; c_yel=$'\033[0;33m'
@@ -68,7 +71,8 @@ while [[ $# -gt 0 ]]; do
         --only-fail2ban) ONLY_F2B=1; shift ;;
         --ssh-mode)   SSH_MODE="${2:?normal ou aggressive}"; shift 2 ;;
         --allow-ip)   ALLOW_IP="${2:?informe um ou mais IPs}"; shift 2 ;;
-        -h|--help)    sed -n '3,22p' "$0" | sed 's/^# \?//'; exit 0 ;;
+        --disable-pam) PAM_VALUE="no"; shift ;;
+        -h|--help)    sed -n '3,23p' "$0" | sed 's/^# \?//'; exit 0 ;;
         *)            die "opcao desconhecida: $1" ;;
     esac
 done
@@ -98,9 +102,9 @@ if [[ -n "${ROLLBACK_DIR:-}" ]]; then
     systemctl restart ssh
     ok "Configuracao SSH restaurada e servico reiniciado."
 
-    if [[ -f "$F2B_JAIL" ]]; then
+    if [[ -f "$F2B_JAIL" || -f "$F2B_JAIL_OLD" ]]; then
         info "Removendo jail do fail2ban e desbanindo todos os IPs"
-        rm -f "$F2B_JAIL"
+        rm -f "$F2B_JAIL" "$F2B_JAIL_OLD"
         fail2ban-client unban --all >/dev/null 2>&1 || true
         systemctl restart fail2ban 2>/dev/null || true
         ok "fail2ban revertido (pacote mantido instalado)."
@@ -172,7 +176,7 @@ run cp -a "$SSHD_CONFIG" "$BACKUP_DIR/"
 # scanners que leem os arquivos em vez do valor efetivo.
 info "Neutralizando diretivas conflitantes..."
 shopt -s nullglob
-for f in "$SSHD_CONFIG" "$SSHD_CONFIG_D"/*.conf; do
+for f in "$SSHD_CONFIG_D"/*.conf; do
     [[ "$f" == "$OVERRIDE" ]] && continue
     if grep -qiE '^[[:space:]]*(PasswordAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication)[[:space:]]+yes' "$f"; then
         info "  ajustando $f"
@@ -182,13 +186,16 @@ done
 shopt -u nullglob
 
 # ---------- 6. escrever override ----------
-if grep -qiE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/' "$SSHD_CONFIG"; then
+HAS_INCLUDE=0
+grep -qiE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/' "$SSHD_CONFIG" && HAS_INCLUDE=1
+
+if (( HAS_INCLUDE )); then
     info "Escrevendo $OVERRIDE"
     run mkdir -p "$SSHD_CONFIG_D"
     if (( DRY_RUN )); then
         printf '  %s(dry-run)%s conteudo do override\n' "$c_yel" "$c_off"
     else
-        cat > "$OVERRIDE" <<'EOF'
+        cat > "$OVERRIDE" <<EOF
 # Gerado por ssh-hardening.sh
 # Prefixo 00- garante precedencia sobre 50-cloud-init.conf e afins.
 
@@ -197,21 +204,73 @@ KbdInteractiveAuthentication no
 PubkeyAuthentication yes
 PermitRootLogin prohibit-password
 AuthenticationMethods publickey
-
-# UsePAM fica ATIVO de proposito: e o recomendado no Ubuntu (CIS Benchmark).
-# Ele nao abre caminho de senha aqui - quem faz isso e o KbdInteractive,
-# ja desativado acima. Desligar o PAM quebra pam_systemd (systemctl --user),
-# pam_limits (nofile/nproc), expiracao de contas e /etc/nologin.
-UsePAM yes
+UsePAM $PAM_VALUE
 EOF
         chmod 600 "$OVERRIDE"
     fi
-else
-    # Ubuntu 18.04/20.04 antigos: sem Include, escreve no arquivo principal
-    warn "Sem diretiva Include - aplicando direto em $SSHD_CONFIG"
-    if (( ! DRY_RUN )); then
-        printf '\n# ssh-hardening.sh\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nPubkeyAuthentication yes\nPermitRootLogin prohibit-password\nUsePAM yes\n' >> "$SSHD_CONFIG"
+fi
+
+# 6b. Espelhar os valores DENTRO do sshd_config principal.
+#
+# Por que: o override acima ja resolve o comportamento real do sshd, mas
+# scanners de painel costumam ler apenas /etc/ssh/sshd_config e procurar a
+# linha literal. Sem ela, assumem o padrao do OpenSSH (yes) e acusam o alerta
+# mesmo com tudo correto.
+#
+# Cuidado importante: NAO usar >> para acrescentar. Se o arquivo terminar com
+# um bloco "Match", o append cai dentro dele e a diretiva passa a valer so
+# para aquele grupo. Por isso inserimos logo apos o Include e removemos
+# ocorrencias antigas apenas antes do primeiro Match.
+info "Espelhando diretivas em $SSHD_CONFIG (para scanners que leem o arquivo)"
+
+if (( ! DRY_RUN )); then
+    blk="# ssh-hardening.sh - valores explicitos
+# (o override em sshd_config.d/ tem precedencia; estes sao identicos)
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+PubkeyAuthentication yes
+PermitRootLogin prohibit-password
+UsePAM $PAM_VALUE"
+
+    tmp=$(mktemp)
+    awk -v blk="$blk" -v has_inc="$HAS_INCLUDE" '
+        BEGIN { ins = 0; inmatch = 0 }
+        NR == 1 && !has_inc { print blk; print ""; ins = 1 }
+        /^[[:space:]]*[Mm]atch[[:space:]]+/ { inmatch = 1 }
+        {
+            if (!inmatch) {
+                k = tolower($1); sub(/^#+/, "", k)
+                if (k == "passwordauthentication" || k == "kbdinteractiveauthentication" ||
+                    k == "challengeresponseauthentication" || k == "usepam" ||
+                    k == "pubkeyauthentication" || k == "permitrootlogin") next
+            }
+            print
+            if (!ins && $0 ~ /^[[:space:]]*[Ii]nclude[[:space:]]+\/etc\/ssh\/sshd_config\.d\//) {
+                print ""; print blk; ins = 1
+            }
+        }
+    ' "$SSHD_CONFIG" > "$tmp"
+
+    if [[ -s "$tmp" ]] && grep -q '^PasswordAuthentication no' "$tmp"; then
+        cat "$tmp" > "$SSHD_CONFIG"
+        ok "  diretivas gravadas no arquivo principal"
+    else
+        warn "  falha ao reescrever - mantendo o original"
     fi
+    rm -f "$tmp"
+fi
+
+# Blocos Match sao preservados de proposito (podem ser intencionais), mas
+# um Match com PasswordAuthentication yes reabre senha para aquele grupo.
+if (( ! DRY_RUN )) && awk '/^[[:space:]]*[Mm]atch[[:space:]]+/{m=1} m && tolower($1)=="passwordauthentication" && tolower($2)=="yes"{found=1} END{exit !found}' "$SSHD_CONFIG"; then
+    warn "Existe um bloco Match com PasswordAuthentication yes em $SSHD_CONFIG."
+    warn "Senha continua permitida para aquele grupo. Revise manualmente."
+fi
+
+if [[ "$PAM_VALUE" == "no" ]]; then
+    warn "UsePAM=no aplicado. TESTE antes de fechar a sessao:"
+    warn "  systemctl --user status   e   ulimit -n"
 fi
 
 # ---------- 7. validar ----------
@@ -328,6 +387,12 @@ dbpurgeage = 30d
 EOF
 
         mkdir -p /etc/fail2ban/jail.d
+        # Remove o local antigo (jail.d) para nao existirem duas fontes.
+        # Ordem de leitura do fail2ban: jail.conf -> jail.d/*.conf ->
+        # jail.local -> jail.d/*.local. Um arquivo em jail.d/*.local
+        # sobrescreveria o jail.local silenciosamente.
+        rm -f "$F2B_JAIL_OLD"
+
         cat > "$F2B_JAIL" <<EOF
 # Gerado por ssh-hardening.sh
 [DEFAULT]
@@ -347,9 +412,12 @@ enabled  = true
 port     = $ports
 maxretry = 3
 $backend_line
-# mode=$SSH_MODE  (normal | ddos | extra | aggressive)
-# aggressive = normal + ddos + extra: tambem bane quem so abre e fecha
-# conexao sem autenticar. Cuidado se houver health-check de LB na porta SSH.
+
+# As duas linhas abaixo dizem a mesma coisa de propositos diferentes:
+# 'mode' e a forma canonica (e a que scanners de painel procuram);
+# 'filter' torna explicito, sem depender da interpolacao do jail.conf.
+# normal | ddos | extra | aggressive
+mode     = $SSH_MODE
 filter   = sshd[mode=$SSH_MODE]
 EOF
         chmod 644 "$F2B_JAIL" "$F2B_LOCAL"
