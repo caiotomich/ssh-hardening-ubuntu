@@ -17,6 +17,9 @@
 #   --ssh-mode normal|aggressive   sshd filter mode (default: aggressive)
 #   --allow-ip "1.2.3.4 5.6.7.0/24"  IPs fail2ban must never ban
 #   --disable-pam              set UsePAM no (see the risks in the README)
+#   --enable-ufw               enable ufw with default deny incoming
+#   --allow-port 443           open an inbound TCP port (repeatable)
+#   --docker-group [USER]      add USER (default: $SUDO_USER) to the docker group
 #
 # The safety net schedules an automatic restore of the backup. Test your
 # access, then cancel the timer with the command printed at the end.
@@ -43,6 +46,11 @@ ONLY_F2B=0
 SSH_MODE="aggressive"
 ALLOW_IP=""
 PAM_VALUE="yes"
+ENABLE_UFW=0
+UFW_PORTS=""
+DOCKER_GROUP=0
+DOCKER_USER="${SUDO_USER:-}"
+readonly UFW_MARKER_NAME="ufw-enabled-by-script"
 
 # ---------- output ----------
 c_red=$'\033[0;31m'; c_grn=$'\033[0;32m'; c_yel=$'\033[0;33m'
@@ -84,11 +92,18 @@ while [[ $# -gt 0 ]]; do
         --ssh-mode)   SSH_MODE="${2:?normal or aggressive}"; shift 2 ;;
         --allow-ip)   ALLOW_IP="${2:?one or more IPs required}"; shift 2 ;;
         --disable-pam) PAM_VALUE="no"; shift ;;
+        --enable-ufw) ENABLE_UFW=1; shift ;;
+        --allow-port) UFW_PORTS="${UFW_PORTS:+$UFW_PORTS }${2:?port number required}"; shift 2 ;;
+        --docker-group)
+            DOCKER_GROUP=1
+            # optional username: consume it only if it isn't another flag
+            if [[ -n "${2:-}" && "$2" != -* ]]; then DOCKER_USER="$2"; shift 2; else shift; fi
+            ;;
         -h|--help)
             if (( PIPED )); then
                 printf 'Download the script to read the full help:\n  curl -fsSL %s -o ssh-hardening.sh && bash ssh-hardening.sh --help\n' "$RAW_URL"
             else
-                sed -n '3,22p' "$SELF" | sed 's/^# \?//'
+                sed -n '3,25p' "$SELF" | sed 's/^# \?//'
             fi
             exit 0 ;;
         *)            die "unknown option: $1" ;;
@@ -97,6 +112,16 @@ done
 
 [[ $EUID -eq 0 ]] || die "must run as root (sudo $SELF_LABEL)"
 [[ "$SSH_MODE" =~ ^(normal|ddos|extra|aggressive)$ ]] || die "invalid --ssh-mode: $SSH_MODE"
+
+# --allow-port on its own is meaningless: without ufw enabled there is no
+# firewall to open a port in. Treat it as implying --enable-ufw.
+if [[ -n "$UFW_PORTS" ]]; then
+    for _p in $UFW_PORTS; do
+        [[ "$_p" =~ ^[0-9]+$ ]] && (( _p >= 1 && _p <= 65535 )) \
+            || die "invalid --allow-port value: $_p"
+    done
+    (( ENABLE_UFW )) || { ENABLE_UFW=1; info "--allow-port implies --enable-ufw"; }
+fi
 
 # Find the IP you are connected from, so you never ban yourself.
 # Note: sudo clears SSH_CLIENT by default (env_reset), hence the fallbacks.
@@ -126,6 +151,16 @@ if [[ -n "${ROLLBACK_DIR:-}" ]]; then
         fail2ban-client unban --all >/dev/null 2>&1 || true
         systemctl restart fail2ban 2>/dev/null || true
         ok "fail2ban reverted (package left installed)."
+    fi
+
+    # Only disable ufw if this script was the one that enabled it. A firewall
+    # that was already running before is not ours to turn off.
+    if [[ -f "$ROLLBACK_DIR/$UFW_MARKER_NAME" ]]; then
+        info "Disabling ufw (it was enabled by this script)"
+        ufw --force disable >/dev/null 2>&1 || true
+        ok "ufw disabled."
+    elif command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi '^status: active'; then
+        warn "ufw is active but predates this script - left untouched."
     fi
     exit 0
 fi
@@ -317,10 +352,13 @@ ok "Syntax is valid."
 
 # ---------- 8. safety net ----------
 if (( SAFETY_NET > 0 && ! DRY_RUN )); then
+    # The marker file is checked at rollback time, not now: the ufw section
+    # runs later, so we can't know yet whether we enabled it.
     systemd-run --unit="$TIMER_UNIT" --on-active="${SAFETY_NET}m" \
         /bin/bash -c "cp -a '$BACKUP_DIR/sshd_config' '$SSHD_CONFIG'; \
                       rm -rf '$SSHD_CONFIG_D'; \
                       [ -d '$BACKUP_DIR/sshd_config.d' ] && cp -a '$BACKUP_DIR/sshd_config.d' '$SSHD_CONFIG_D'; \
+                      [ -f '$BACKUP_DIR/$UFW_MARKER_NAME' ] && ufw --force disable; \
                       systemctl restart ssh" >/dev/null 2>&1
     warn "Automatic rollback scheduled in ${SAFETY_NET} minute(s)."
 fi
@@ -352,7 +390,160 @@ fi
 
 fi   # <-- end of the sshd block (--only-fail2ban skips everything above)
 
-# ---------- 11. fail2ban ----------
+# ---------- 11. docker group ----------
+# Equivalent to: sudo usermod -aG docker $USER
+#
+# But NOT with $USER. Under sudo, env_reset sets USER=root, so the literal
+# command would try to add root to the docker group - pointless, and it hides
+# the fact that the user you meant was never added. SUDO_USER is the one who
+# invoked sudo, which is who you actually want.
+setup_docker_group() {
+    local u="$DOCKER_USER"
+
+    if [[ -z "$u" ]]; then
+        warn "  could not tell which user to add (SUDO_USER is empty)."
+        warn "  Pass it explicitly: --docker-group USERNAME"
+        return 1
+    fi
+
+    if [[ "$u" == "root" ]]; then
+        warn "  root already has full access - nothing to do"
+        return 1
+    fi
+
+    id -u "$u" >/dev/null 2>&1 || { warn "  no such user: $u"; return 1; }
+
+    if ! getent group docker >/dev/null 2>&1; then
+        warn "  the 'docker' group does not exist - is Docker installed?"
+        warn "  install Docker first, then re-run with --docker-group"
+        return 1
+    fi
+
+    if id -nG "$u" 2>/dev/null | tr ' ' '\n' | grep -qx docker; then
+        ok "  $u is already in the docker group"
+        return 0
+    fi
+
+    run usermod -aG docker "$u"
+    (( DRY_RUN )) && return 0
+
+    if id -nG "$u" 2>/dev/null | tr ' ' '\n' | grep -qx docker; then
+        ok "  $u added to the docker group"
+        warn "  membership only applies to NEW sessions - log out and back in"
+        warn "  the docker group is root-equivalent: members can mount the host"
+        warn "  filesystem inside a container and escape to root"
+        return 0
+    fi
+
+    warn "  usermod ran but $u is still not in the group"
+    return 1
+}
+
+if (( DOCKER_GROUP )); then
+    printf '\n'
+    info "Configuring docker group membership..."
+    setup_docker_group || true
+fi
+
+# ---------- 12. ufw ----------
+# Runs BEFORE fail2ban on purpose: the fail2ban section picks its banaction
+# based on whether ufw is active, so ufw has to be up by then.
+setup_ufw() {
+    local ssh_ports p was_active=0
+
+    if ! command -v ufw >/dev/null 2>&1; then
+        info "  installing ufw..."
+        run env DEBIAN_FRONTEND=noninteractive apt-get update -qq
+        run env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ufw
+    fi
+
+    # The SSH port has to come from the running config. Guessing 22 here
+    # would lock out anyone who moved SSH elsewhere.
+    ssh_ports=$(sshd -T 2>/dev/null | awk '/^port /{print $2}')
+    if [[ -z "$ssh_ports" ]]; then
+        warn "  could not read the SSH port - refusing to enable ufw"
+        return 1
+    fi
+
+    # SSH rules FIRST, always. Turning on default-deny without them is an
+    # instant lockout of every session that isn't already open.
+    for p in $ssh_ports; do
+        info "  allowing SSH on ${p}/tcp"
+        run ufw allow "${p}/tcp" comment 'SSH - ssh-hardening.sh' >/dev/null
+    done
+
+    for p in $UFW_PORTS; do
+        info "  allowing inbound ${p}/tcp"
+        run ufw allow "${p}/tcp" comment 'ssh-hardening.sh' >/dev/null
+    done
+
+    run ufw default deny incoming >/dev/null
+    run ufw default allow outgoing >/dev/null
+
+    if (( DRY_RUN )); then
+        printf '  %s(dry-run)%s would run: ufw --force enable\n' "$c_yel" "$c_off"
+        return 0
+    fi
+
+    # Confirm the SSH rule really landed before flipping the switch.
+    # 'ufw status' shows nothing while inactive, so we check 'show added'.
+    for p in $ssh_ports; do
+        if ! ufw show added 2>/dev/null | grep -q "allow ${p}/tcp"; then
+            warn "  SSH rule for port ${p} was not registered - NOT enabling ufw"
+            return 1
+        fi
+    done
+
+    ufw status 2>/dev/null | grep -qi '^status: active' && was_active=1
+    if (( ! was_active )); then
+        # Marker so rollback (and the safety net) know we were the ones who
+        # turned it on, and won't disable a firewall that was already there.
+        mkdir -p "$BACKUP_DIR"
+        touch "$BACKUP_DIR/$UFW_MARKER_NAME"
+    fi
+
+    ufw --force enable >/dev/null 2>&1 || { warn "  ufw enable failed"; return 1; }
+
+    if ! ufw status verbose 2>/dev/null | grep -qi 'status: active'; then
+        warn "  ufw did not become active"
+        return 1
+    fi
+
+    ufw status verbose 2>/dev/null | grep -iE '^(status|default):' | sed 's/^/       /'
+
+    if ufw status verbose 2>/dev/null | grep -qi 'deny (incoming)'; then
+        ok "  default incoming policy is deny"
+    else
+        warn "  default incoming policy is NOT deny - check 'ufw status verbose'"
+    fi
+
+    # Docker writes its own rules into the nat/PREROUTING chain, which is
+    # evaluated BEFORE ufw's chains. Published container ports stay reachable
+    # from the internet despite 'deny incoming' - and the scanner will happily
+    # report the policy as compliant while those ports are wide open.
+    if command -v docker >/dev/null 2>&1; then
+        printf '\n'
+        warn "  Docker is installed. It BYPASSES ufw: any port published with"
+        warn "  -p 8080:80 stays reachable even with 'deny incoming' set."
+        warn "  Publish on loopback instead:  -p 127.0.0.1:8080:80"
+        warn "  Check what is actually exposed: iptables -t nat -L DOCKER -n"
+    fi
+}
+
+UFW_OK=0
+if (( ENABLE_UFW )); then
+    printf '\n'
+    info "Configuring ufw..."
+    if setup_ufw; then
+        UFW_OK=1
+        (( DRY_RUN )) || ok "ufw active, inbound denied by default."
+    else
+        warn "ufw was NOT enabled. Nothing was left half-configured,"
+        warn "but review it: sudo ufw status verbose"
+    fi
+fi
+
+# ---------- 13. fail2ban ----------
 setup_fail2ban() {
     local ver backend_line banaction ignore ip ports nregex
 
@@ -503,7 +694,7 @@ else
     fi
 fi
 
-# ---------- 12. final instructions ----------
+# ---------- 14. final instructions ----------
 cat <<EOF
 
 ${c_yel}DO NOT CLOSE THIS SESSION YET.${c_off}
@@ -535,6 +726,17 @@ Useful fail2ban commands:
 Tip: if your client offers several keys on connect, it can exceed MaxAuthTries
 and get you banned. Avoid that with:
   ssh -o IdentitiesOnly=yes -i ~/.ssh/your_key user@<ip>
+
+EOF
+fi
+
+if (( UFW_OK )); then
+    cat <<EOF
+Useful ufw commands:
+  sudo ufw status verbose                   # rules and default policies
+  sudo ufw allow 8080/tcp                   # open another inbound port
+  sudo ufw delete allow 8080/tcp            # close it again
+  sudo ufw disable                          # turn the firewall off
 
 EOF
 fi
