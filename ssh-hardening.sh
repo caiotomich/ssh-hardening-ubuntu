@@ -2,7 +2,7 @@
 #
 # ssh-hardening.sh - Desativa senha no SSH + configura fail2ban (Ubuntu/Debian)
 #
-# Copyright (c) 2026 SEU NOME
+# Copyright (c) 2026 Caio Tomich
 # Licenciado sob a MIT License. Veja o arquivo LICENSE.
 #
 # Uso:
@@ -60,6 +60,17 @@ run() {
     fi
 }
 
+# Quando o script chega por 'curl | bash', $0 vale "bash" e nao existe
+# arquivo no disco. Guardamos um nome utilizavel para as mensagens.
+SELF="${BASH_SOURCE[0]:-$0}"
+if [[ -f "$SELF" ]]; then
+    readonly SELF_LABEL="$SELF"
+    readonly PIPED=0
+else
+    readonly SELF_LABEL="./ssh-hardening.sh"
+    readonly PIPED=1
+fi
+
 # ---------- argumentos ----------
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -72,12 +83,18 @@ while [[ $# -gt 0 ]]; do
         --ssh-mode)   SSH_MODE="${2:?normal ou aggressive}"; shift 2 ;;
         --allow-ip)   ALLOW_IP="${2:?informe um ou mais IPs}"; shift 2 ;;
         --disable-pam) PAM_VALUE="no"; shift ;;
-        -h|--help)    sed -n '3,23p' "$0" | sed 's/^# \?//'; exit 0 ;;
+        -h|--help)
+            if (( PIPED )); then
+                printf 'Baixe o script para ver a ajuda completa:\n  curl -fsSL https://raw.githubusercontent.com/caiotomich/ssh-hardening-ubuntu/main/ssh-hardening.sh -o ssh-hardening.sh && bash ssh-hardening.sh --help\n'
+            else
+                sed -n '3,23p' "$SELF" | sed 's/^# \?//'
+            fi
+            exit 0 ;;
         *)            die "opcao desconhecida: $1" ;;
     esac
 done
 
-[[ $EUID -eq 0 ]] || die "execute como root (sudo $0)"
+[[ $EUID -eq 0 ]] || die "execute como root (sudo $SELF_LABEL)"
 [[ "$SSH_MODE" =~ ^(normal|ddos|extra|aggressive)$ ]] || die "--ssh-mode invalido: $SSH_MODE"
 
 # Descobre o IP de onde voce esta conectado, para nunca se auto-banir.
@@ -159,8 +176,18 @@ sshd -T 2>/dev/null | grep -Ei '^(passwordauthentication|kbdinteractiveauthentic
 
 # ---------- 3. confirmar ----------
 if (( ! FORCE && ! DRY_RUN )); then
-    printf '\n%sDesativar autenticacao por senha agora? [s/N]%s ' "$c_yel" "$c_off"
-    read -r resp
+    # Com 'curl | bash' o stdin E o proprio script: um 'read' comum
+    # consumiria linhas de codigo como se fossem a sua resposta.
+    if [[ -r /dev/tty ]]; then
+        printf '\n%sDesativar autenticacao por senha agora? [s/N]%s ' "$c_yel" "$c_off" > /dev/tty
+        read -r resp < /dev/tty
+    elif (( PIPED )); then
+        die "Sem terminal para confirmar. Use --force ou baixe o script antes:
+       curl -fsSL https://raw.githubusercontent.com/caiotomich/ssh-hardening-ubuntu/main/ssh-hardening.sh -o ssh-hardening.sh && sudo bash ssh-hardening.sh"
+    else
+        printf '\n%sDesativar autenticacao por senha agora? [s/N]%s ' "$c_yel" "$c_off"
+        read -r resp
+    fi
     [[ "$resp" =~ ^[sSyY]$ ]] || { info "Cancelado."; exit 0; }
 fi
 
@@ -516,5 +543,5 @@ fi
 cat <<EOF
 Backup salvo em: $BACKUP_DIR
 Reverter manualmente:
-  sudo $0 --rollback $BACKUP_DIR
+  sudo $SELF_LABEL --rollback $BACKUP_DIR
 EOF
