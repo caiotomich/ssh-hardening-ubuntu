@@ -1,4 +1,4 @@
 # ssh-hardening-ubuntu
 # Verify with: sha256sum -c CHECKSUMS.txt
 
-f53e6dc81d3c879a27ab360662e97442a3eb7b1ad9ebce5786f7cb8f12fa8866  ssh-hardening.sh
+a6afee35e15b641a4df70c512d3aa3397c743515371c0f96ab0dbb797daae1ad  ssh-hardening.sh
