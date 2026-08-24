@@ -2,39 +2,41 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Desativa autenticação por senha no SSH e configura o fail2ban em servidores Ubuntu/Debian, com verificações que evitam o cenário clássico de perder o acesso ao próprio servidor.
+Disables SSH password authentication and configures fail2ban on Ubuntu/Debian servers, with the checks that keep you from locking yourself out of your own machine.
 
-Escrito para resolver os alertas típicos de scanners de segurança de painéis de VPS:
+Written to clear the alerts typical VPS panel security scanners raise:
 
-| Item do relatório | Resolvido por |
+| Scanner item | Fixed by |
 |---|---|
 | Password Authentication should be disabled | `PasswordAuthentication no` + `KbdInteractiveAuthentication no` |
-| Fail2Ban should be installed | instalação via `apt` |
+| Fail2Ban should be installed | installation via `apt` |
 | Fail2Ban service should be enabled | `systemctl enable fail2ban` |
-| Fail2Ban service should be running | `systemctl restart` + verificação de estado |
-| SSH protection should be enabled | jail `[sshd]` com `enabled = true` |
-| Aggressive mode recommended | `filter = sshd[mode=aggressive]` |
+| Fail2Ban service should be running | `systemctl restart` + state verification |
+| SSH protection should be enabled | `[sshd]` jail with `enabled = true` |
+| Aggressive mode recommended | `mode = aggressive` |
+
+*Documentação em português: [README.pt-BR.md](README.pt-BR.md)*
 
 ---
 
-## Requisitos
+## Requirements
 
-- Ubuntu 18.04+ ou Debian 10+
-- Acesso root (`sudo`)
-- **Uma chave pública SSH já instalada** — o script recusa rodar sem isso
+- Ubuntu 18.04+ or Debian 10+
+- Root access (`sudo`)
+- **An SSH public key already installed** — the script refuses to run without one
 
-Se ainda não tiver, execute na sua máquina local antes de qualquer coisa:
+If you don't have one yet, run this on your local machine first:
 
 ```bash
-ssh-copy-id usuario@ip-do-servidor
-ssh usuario@ip-do-servidor    # precisa entrar sem pedir senha
+ssh-copy-id user@server-ip
+ssh user@server-ip    # must log in without asking for a password
 ```
 
 ---
 
-## Instalação
+## Installation
 
-**Recomendado** — baixa, você inspeciona, depois executa:
+**Recommended** — download, inspect, then run:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/caiotomich/ssh-hardening-ubuntu/main/ssh-hardening.sh -o ssh-hardening.sh \
@@ -42,16 +44,16 @@ curl -fsSL https://raw.githubusercontent.com/caiotomich/ssh-hardening-ubuntu/mai
   && sudo bash ssh-hardening.sh --safety-net 10
 ```
 
-**One-liner**, se preferir:
+**One-liner**, if you prefer:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/caiotomich/ssh-hardening-ubuntu/main/ssh-hardening.sh \
   | sudo bash -s -- --force --safety-net 10
 ```
 
-O `-s --` é obrigatório: sem ele o bash interpreta `--force` como opção própria, não do script.
+The `-s --` is required: without it bash treats `--force` as its own option rather than the script's.
 
-**Ou via git:**
+**Or via git:**
 
 ```bash
 git clone https://github.com/caiotomich/ssh-hardening-ubuntu.git
@@ -59,83 +61,83 @@ cd ssh-hardening-ubuntu
 sudo ./ssh-hardening.sh --safety-net 10
 ```
 
-### Por que a versão em duas etapas é preferível
+### Why the two-step version is preferable
 
-Não é purismo. Em `curl | bash`, se a conexão cair no meio do download o bash executa o pedaço que chegou — um script cortado na linha errada aplica metade das mudanças e nunca alcança a validação do `sshd -t`. Num script que mexe no seu acesso SSH, isso importa.
+This isn't purism. With `curl | bash`, if the connection drops mid-download bash executes whatever arrived — a script truncated at the wrong line applies half the changes and never reaches the `sshd -t` validation. In a script that touches your SSH access, that matters.
 
-O `curl -o arquivo && bash arquivo` resolve porque o curl retorna código de erro em transferência incompleta e o `&&` impede a execução.
+`curl -o file && bash file` solves it because curl returns a non-zero exit code on an incomplete transfer, and `&&` stops execution.
 
-Os outros dois motivos são os de sempre: você roda código como root sem ter lido, e um servidor pode servir conteúdo diferente para `curl` e para navegador.
+The other two reasons are the usual ones: you're running code as root without having read it, and a server can serve different content to `curl` than to a browser.
 
-### Verificar integridade
+### Verify integrity
 
 ```bash
 sha256sum ssh-hardening.sh
 ```
 
-Compare com o valor publicado em [CHECKSUMS.txt](CHECKSUMS.txt).
+Compare against the value published in [CHECKSUMS.txt](CHECKSUMS.txt).
 
 ---
 
-## Uso
+## Usage
 
 ```bash
 chmod +x ssh-hardening.sh
 
-sudo ./ssh-hardening.sh --dry-run          # ver o que aconteceria
-sudo ./ssh-hardening.sh --safety-net 10    # aplicar com rede de proteção
+sudo ./ssh-hardening.sh --dry-run          # see what would happen
+sudo ./ssh-hardening.sh --safety-net 10    # apply with a safety net
 ```
 
-### Fluxo recomendado na primeira execução
+### Recommended first run
 
-1. Rode com `--dry-run` e leia a saída.
-2. Rode com `--safety-net 10`.
-3. **Sem fechar a sessão atual**, abra outro terminal e teste o acesso por chave.
-4. Confirme que a senha foi bloqueada:
+1. Run with `--dry-run` and read the output.
+2. Run with `--safety-net 10`.
+3. **Without closing your current session**, open another terminal and test key-based access.
+4. Confirm passwords are blocked:
    ```bash
-   ssh -o PubkeyAuthentication=no -o PreferredAuthentications=password usuario@ip
+   ssh -o PubkeyAuthentication=no -o PreferredAuthentications=password user@ip
    ```
-   O esperado é `Permission denied (publickey)`.
-5. Deu tudo certo? Cancele o rollback automático:
+   You should get `Permission denied (publickey)`.
+5. All good? Cancel the automatic rollback:
    ```bash
    sudo systemctl stop ssh-hardening-rollback.timer
    ```
 
-Se algo der errado e você perder o acesso, é só esperar os 10 minutos: o servidor se restaura sozinho.
+If something goes wrong and you lose access, just wait out the 10 minutes — the server restores itself.
 
 ---
 
-## Opções
+## Options
 
-| Flag | Efeito |
+| Flag | Effect |
 |---|---|
-| `--dry-run` | Mostra todas as ações sem executar nenhuma |
-| `--force` | Não pede confirmação interativa |
-| `--safety-net N` | Agenda restauração automática do backup em N minutos |
-| `--rollback DIR` | Restaura um backup anterior e reverte o fail2ban |
-| `--skip-fail2ban` | Só mexe no sshd |
-| `--only-fail2ban` | Só configura o fail2ban, não altera o sshd |
-| `--ssh-mode MODO` | `normal`, `ddos`, `extra` ou `aggressive` (padrão) |
-| `--allow-ip "IPs"` | IPs ou faixas que o fail2ban nunca deve banir |
-| `--disable-pam` | Aplica `UsePAM no` (leia os riscos abaixo antes) |
-| `-h`, `--help` | Ajuda resumida |
+| `--dry-run` | Shows every action without performing any |
+| `--force` | Skips the interactive confirmation |
+| `--safety-net N` | Schedules an automatic backup restore in N minutes |
+| `--rollback DIR` | Restores a previous backup and reverts fail2ban |
+| `--skip-fail2ban` | Touches sshd only |
+| `--only-fail2ban` | Configures fail2ban only, leaves sshd alone |
+| `--ssh-mode MODE` | `normal`, `ddos`, `extra` or `aggressive` (default) |
+| `--allow-ip "IPs"` | IPs or ranges fail2ban must never ban |
+| `--disable-pam` | Applies `UsePAM no` (read the risks below first) |
+| `-h`, `--help` | Short help |
 
 ---
 
-## O que é alterado
+## What gets changed
 
-### Arquivos criados
+### Files created
 
 ```
-/etc/ssh/sshd_config.d/00-hardening.conf   # diretivas do sshd
-/etc/fail2ban/jail.local                   # jail [sshd] e defaults
-/etc/fail2ban/fail2ban.local               # allowipv6 e retenção do banco
-/root/ssh-backup-AAAAMMDD-HHMMSS/          # backup da config original
+/etc/ssh/sshd_config.d/00-hardening.conf   # sshd directives
+/etc/fail2ban/jail.local                   # [sshd] jail and defaults
+/etc/fail2ban/fail2ban.local               # allowipv6 and database retention
+/root/ssh-backup-YYYYMMDD-HHMMSS/          # backup of the original config
 ```
 
-O script **nunca edita** `jail.conf` nem `fail2ban.conf` — esses arquivos são sobrescritos a cada atualização do pacote.
+The script **never edits** `jail.conf` or `fail2ban.conf` — those files are overwritten on every package upgrade.
 
-### Configuração aplicada ao sshd
+### sshd configuration applied
 
 ```
 PasswordAuthentication no
@@ -146,183 +148,177 @@ AuthenticationMethods publickey
 UsePAM yes
 ```
 
-### Configuração aplicada ao fail2ban
+### fail2ban configuration applied
 
 ```ini
 [DEFAULT]
 bantime   = 1h
 findtime  = 10m
 maxretry  = 5
-bantime.increment = true    # 1h → 2h → 4h ... até 1 semana
+bantime.increment = true    # 1h → 2h → 4h ... up to one week
 bantime.factor    = 2
 bantime.maxtime   = 1w
 
 [sshd]
 enabled  = true
 maxretry = 3
-filter   = sshd[mode=aggressive]
+mode     = aggressive
 ```
 
 ---
 
-## Proteções contra lockout
+## Lockout protections
 
-O script foi construído em torno da premissa de que a falha mais provável não é um invasor — é você mesmo se trancando para fora.
+The script is built around the assumption that the likeliest failure isn't an attacker — it's you locking yourself out.
 
-**Verificação de chaves antes de tudo.** Ele varre `/root` e `/home/*` procurando `authorized_keys` com pelo menos uma chave válida, e também respeita `AuthorizedKeysFile` customizado. Sem nenhuma chave, aborta antes de tocar em qualquer arquivo.
+**Key check before anything else.** It scans `/root` and `/home/*` for an `authorized_keys` holding at least one valid key, and honours a custom `AuthorizedKeysFile` too. With no key found, it aborts before touching a single file.
 
-**Backup e validação.** Toda a configuração vai para `/root/ssh-backup-*` antes de qualquer edição. Se o `sshd -t` reprovar a sintaxe, o script restaura sozinho e sai sem reiniciar o serviço.
+**Backup and validation.** The whole configuration is copied to `/root/ssh-backup-*` before any edit. If `sshd -t` rejects the syntax, the script restores it and exits without restarting the service.
 
-**Rede de proteção temporizada.** Com `--safety-net N`, um `systemd-run` agenda a restauração do backup para daqui a N minutos. Você cancela manualmente depois de confirmar que o acesso funciona.
+**Timed safety net.** With `--safety-net N`, a `systemd-run` unit schedules a backup restore N minutes out. You cancel it manually once you've confirmed access works.
 
-**Whitelist automática no fail2ban.** O IP da sua sessão atual entra no `ignoreip`. Como o `sudo` limpa `SSH_CLIENT` por padrão (`env_reset`), há três fallbacks encadeados: `SSH_CONNECTION`, `who am i` e `last`. Se nenhum funcionar, o script avisa e sugere `--allow-ip`.
+**Automatic fail2ban whitelist.** Your current session's IP goes into `ignoreip`. Since sudo clears `SSH_CLIENT` by default (`env_reset`), there are three chained fallbacks: `SSH_CONNECTION`, `who am i` and `last`. If none work, the script warns and suggests `--allow-ip`.
 
 ---
 
-## Decisões técnicas
+## Design decisions
 
-Algumas escolhas do script contrariam checklists genéricos que circulam pela internet. Vale entender o porquê.
+Some choices here contradict the generic checklists floating around the internet. Worth understanding why.
 
-### `UsePAM yes` é mantido de propósito
+### `UsePAM yes` is kept on purpose
 
-Muitos guias mandam desativar o PAM quando se usa autenticação por chave. No Ubuntu isso é contraproducente, e o próprio CIS Benchmark recomenda `UsePAM yes`. Ao desativar, você perde:
+Plenty of guides tell you to disable PAM when using key-based authentication. On Ubuntu that's counterproductive, and the CIS Benchmark itself recommends `UsePAM yes`. Disabling it costs you:
 
-- **pam_systemd** — sem registro no `loginctl` e sem `XDG_RUNTIME_DIR`, o que quebra `systemctl --user` e derruba serviços de usuário na desconexão
-- **pam_limits** — `/etc/security/limits.conf` deixa de valer (`nofile`, `nproc`), o que costuma reaparecer depois como "too many open files"
-- **Expiração e bloqueio de contas**, `/etc/nologin`, motd, faillock
-- **SSSD, LDAP ou Kerberos**, se você usar
+- **pam_systemd** — no `loginctl` session registration and no `XDG_RUNTIME_DIR`, which breaks `systemctl --user` and kills user services on disconnect
+- **pam_limits** — `/etc/security/limits.conf` stops applying (`nofile`, `nproc`), which usually resurfaces later as "too many open files"
+- **Account expiry and locking**, `/etc/nologin`, motd, faillock
+- **SSSD, LDAP or Kerberos**, if you use any
 
-E o principal: `UsePAM no` não fecha nenhuma porta aqui. Quem permitia senha era o `KbdInteractiveAuthentication`, já desativado. O PAM cuida de sessão e validação de conta, não do método de autenticação.
+And the main point: `UsePAM no` closes no door here. What allowed passwords was `KbdInteractiveAuthentication`, already disabled. PAM handles session setup and account validation, not the authentication method.
 
-O risco real com PAM existe, mas é outro: `UsePAM yes` combinado com `KbdInteractiveAuthentication yes` permite senha via challenge-response mesmo com `PasswordAuthentication no`. É exatamente por isso que aquela diretiva está no override.
+There is a real PAM risk, but it's a different one: `UsePAM yes` combined with `KbdInteractiveAuthentication yes` permits password auth via challenge-response even with `PasswordAuthentication no`. That's precisely why that directive is in the override.
 
-**A flag `--disable-pam` existe mesmo assim**, porque alguns scanners de painel tratam `UsePAM yes` como falha de conformidade e não há meio-termo — a diretiva é binária. Se for exigência, use com rede de proteção e teste antes de fechar a sessão:
+**The `--disable-pam` flag exists anyway**, because some panel scanners treat `UsePAM yes` as a compliance failure and there's no middle ground — the directive is binary. If it's a requirement, use a safety net and test before closing your session:
 
 ```bash
 sudo ./ssh-hardening.sh --disable-pam --safety-net 10
 
-# em outro terminal: login novo por chave precisa funcionar
-ssh usuario@ip
+# in another terminal: a fresh key login must work
+ssh user@ip
 
-# no servidor: os dois que quebram primeiro
-systemctl --user status      # não pode dar "Failed to connect to bus"
-ulimit -n                    # não pode ter caído para 1024
+# on the server: the two things that break first
+systemctl --user status      # must not print "Failed to connect to bus"
+ulimit -n                    # must not have dropped to 1024
 ```
 
-Sem PAM, o sshd valida a conta lendo `/etc/shadow` diretamente. Contas com senha bloqueada (`!`) — o padrão do usuário `ubuntu` em imagens cloud — se comportam de forma diferente. O banner de boas-vindas e o "Last login" também somem, já que são gerados via PAM.
+Without PAM, sshd validates accounts by reading `/etc/shadow` directly. Accounts with a locked password (`!`) — the default for the `ubuntu` user in cloud images — behave differently. The welcome banner and "Last login" also disappear, since PAM generates them.
 
-O fail2ban não é afetado: ele lê os logs do sshd, não passa pelo PAM.
+fail2ban is unaffected: it reads sshd's logs and doesn't go through PAM.
 
-### Precedência dos arquivos de configuração
+### Configuration file precedence
 
-No SSH, **o primeiro valor lido vence**. Como `/etc/ssh/sshd_config` começa com `Include /etc/ssh/sshd_config.d/*.conf`, um `50-cloud-init.conf` deixado pelo provedor com `PasswordAuthentication yes` sobrescreve silenciosamente o que você editar no arquivo principal.
+In SSH, **the first value read wins**. Since `/etc/ssh/sshd_config` starts with `Include /etc/ssh/sshd_config.d/*.conf`, a `50-cloud-init.conf` left behind by your provider carrying `PasswordAuthentication yes` silently overrides whatever you edit in the main file.
 
-Por isso o override usa o prefixo `00-`, e o script ainda comenta as diretivas `yes` conflitantes nos demais arquivos.
+That's why the override uses the `00-` prefix, and why the script also comments out conflicting `yes` directives in the remaining files.
 
-### Espelhamento no arquivo principal
+### Mirroring into the main file
 
-O override sozinho resolve o comportamento real do sshd, mas scanners de painel costumam ler apenas `/etc/ssh/sshd_config` e procurar a linha literal. Sem ela, assumem o padrão do OpenSSH (`yes`) e acusam o alerta mesmo com tudo correto. O script grava os mesmos valores nos dois lugares.
+The override alone fixes sshd's real behaviour, but panel scanners typically read only `/etc/ssh/sshd_config` and look for the literal line. Without it they assume the OpenSSH default (`yes`) and flag the alert even though everything is correct. The script writes the same values in both places.
 
-A inserção é feita logo após a linha `Include`, nunca com `>>`. Se o arquivo terminar com um bloco `Match`, o append cairia dentro dele e a diretiva passaria a valer só para aquele grupo — um erro silencioso e comum.
+The insertion happens right after the `Include` line, never with `>>`. If the file ends with a `Match` block, an append would land inside it and the directive would apply only to that group — a silent and common mistake.
 
-Blocos `Match` existentes são preservados, já que podem ser intencionais. Mas se algum contiver `PasswordAuthentication yes`, o script avisa: senha continua liberada para aquele grupo.
+Existing `Match` blocks are preserved, since they may be intentional. But if one contains `PasswordAuthentication yes`, the script warns you: password auth is still open for that group.
 
-### Ordem de leitura do fail2ban
+### fail2ban read order
 
-A configuração vai para `/etc/fail2ban/jail.local`, não para `jail.d/`. A ordem de leitura é `jail.conf` → `jail.d/*.conf` → `jail.local` → `jail.d/*.local`, então um arquivo em `jail.d/` com extensão `.local` sobrescreveria o `jail.local` silenciosamente.
+Configuration goes to `/etc/fail2ban/jail.local`, not `jail.d/`. The read order is `jail.conf` → `jail.d/*.conf` → `jail.local` → `jail.d/*.local`, so a file in `jail.d/` with a `.local` extension would silently override `jail.local`.
 
-O jail traz `mode = aggressive` e `filter = sshd[mode=aggressive]`, que dizem a mesma coisa. O `mode` é a forma canônica e a que os scanners procuram; o `filter` explícito evita depender da interpolação de variáveis do `jail.conf`.
+The jail carries both `mode = aggressive` and `filter = sshd[mode=aggressive]`, which say the same thing. `mode` is the canonical form and what scanners look for; the explicit `filter` avoids depending on `jail.conf` variable interpolation.
 
-### Backend de log no Ubuntu 24.04
+### Port read from sshd, not assumed
 
-As imagens minimais do Ubuntu 24.04 não trazem mais o rsyslog, então `/var/log/auth.log` não existe. O jail `sshd` do fail2ban falha com *"Have not found any log file"* — o serviço sobe, o scanner marca como "Installed e Active", mas nada está sendo protegido.
+The jail uses the real port from `sshd -T` instead of the default `port = ssh`. If you moved SSH elsewhere, the default would silently monitor port 22.
 
-O script detecta a ausência do arquivo, instala `python3-systemd` e configura `backend = systemd` para ler direto do journal.
+### About aggressive mode
 
-### Porta lida do sshd, não presumida
+It's the default because that's what scanners ask for, but calibrate your expectations.
 
-O jail usa a porta real obtida de `sshd -T`, em vez do `port = ssh` padrão. Se você moveu o SSH para outra porta, o padrão monitoraria a porta 22 sem avisar.
+`aggressive` mode adds the `ddos` and `extra` filters, also banning clients that open and close a connection without ever authenticating. With password auth already disabled, the real gain is **less log noise**, not blocking intrusion — no bot is brute-forcing an Ed25519 key.
 
-### Sobre o modo aggressive
-
-É o padrão porque é o que os scanners pedem, mas vale calibrar a expectativa.
-
-O modo `aggressive` soma os filtros `ddos` e `extra`, banindo também quem abre e fecha conexão sem chegar a autenticar. Com a senha já desativada, o ganho real é **reduzir ruído de log**, não impedir invasão — nenhum bot vai adivinhar uma chave Ed25519 por força bruta.
-
-O risco está do outro lado. Se houver health-check de load balancer ou monitoramento tocando na porta SSH, o modo aggressive vai banir sua própria infraestrutura. Nesses casos:
+The risk runs the other way. If a load balancer health check or monitoring probe touches the SSH port, aggressive mode will ban your own infrastructure. In that case:
 
 ```bash
 sudo ./ssh-hardening.sh --ssh-mode normal
-# ou
+# or
 sudo ./ssh-hardening.sh --allow-ip "10.0.0.0/8"
 ```
 
 ---
 
-## Verificação manual
+## Manual verification
 
 ```bash
-# valores efetivos do sshd (não o que está escrito nos arquivos)
+# effective sshd values (not what's written in the files)
 sudo sshd -T | grep -Ei "passwordauth|kbdinteractive|usepam|pubkeyauth|permitroot"
 
-# procurar diretivas conflitantes espalhadas
+# hunt for conflicting directives
 sudo grep -ri "passwordauthentication" /etc/ssh/
 
-# estado do fail2ban
+# fail2ban state
 sudo fail2ban-client status
 sudo fail2ban-client status sshd
 ```
 
-Estado saudável: `passwordauthentication no`, `kbdinteractiveauthentication no`, `usepam yes`, `pubkeyauthentication yes`.
+A healthy state: `passwordauthentication no`, `kbdinteractiveauthentication no`, `usepam yes`, `pubkeyauthentication yes`.
 
 ---
 
-## Problemas comuns
+## Troubleshooting
 
-**"Nenhuma chave publica encontrada"** — rode `ssh-copy-id` na máquina local antes. É a proteção funcionando.
+**"No public key found"** — run `ssh-copy-id` from your local machine first. That's the protection doing its job.
 
-**Fui banido pelo meu próprio fail2ban** — entre pelo console web/VNC do provedor e execute `fail2ban-client set sshd unbanip SEU.IP`. Depois adicione seu IP com `--allow-ip`.
+**My own fail2ban banned me** — get in through your provider's web/VNC console and run `fail2ban-client set sshd unbanip YOUR.IP`. Then add your IP with `--allow-ip`.
 
-**Meu cliente SSH leva ban ao conectar** — se o agente oferece várias chaves, o `MaxAuthTries` (padrão 6) estoura e conta como tentativas falhas. Force uma chave só:
+**My SSH client gets banned on connect** — if your agent offers several keys, `MaxAuthTries` (default 6) is exceeded and each attempt counts as a failure. Force a single key:
 ```bash
-ssh -o IdentitiesOnly=yes -i ~/.ssh/sua_chave usuario@ip
+ssh -o IdentitiesOnly=yes -i ~/.ssh/your_key user@ip
 ```
 
-**fail2ban não sobe** — veja `journalctl -u fail2ban -n 50`. A causa mais comum é o `/var/log/auth.log` ausente, tratada automaticamente pelo script.
+**fail2ban won't start** — check `journalctl -u fail2ban -n 50`. The most common cause is a missing `/var/log/auth.log`, which the script handles automatically.
 
-**Perdi o acesso completamente** — use o console web/VNC do painel do provedor (DigitalOcean, Hetzner, Contabo, etc. todos oferecem). Lá você entra com senha local, independente do SSH, e roda `sudo ./ssh-hardening.sh --rollback /root/ssh-backup-*`.
+**I lost access completely** — use your provider's web/VNC console (DigitalOcean, Hetzner, Contabo and others all offer one). It logs you in with a local password, independent of SSH, and you can run `sudo ./ssh-hardening.sh --rollback /root/ssh-backup-*`.
 
-**O scanner do painel continua acusando alerta** — confirme primeiro o estado real:
+**The panel scanner still flags an alert** — check the real state first:
 
 ```bash
 sudo sshd -T | grep -Ei 'passwordauth|usepam|kbdinteractive'
 sudo fail2ban-client status sshd
 ```
 
-Se esses comandos mostram os valores corretos, o servidor está certo e o problema é do painel. Duas causas comuns: o relatório vem de cache e só atualiza no próximo scan, ou o painel gerencia o `sshd_config` por conta própria e reescreve edições externas. No segundo caso, procure o toggle equivalente na interface — mudanças feitas por fora tendem a ser revertidas no próximo deploy de configuração.
+If those show the correct values, the server is fine and the problem is the panel. Two common causes: the report is cached and only refreshes on the next scan, or the panel manages `sshd_config` itself and rewrites external edits. In the second case, look for the equivalent toggle in its interface — changes made outside tend to be reverted on the next configuration deploy.
 
 ---
 
-## Reverter
+## Reverting
 
 ```bash
-sudo ./ssh-hardening.sh --rollback /root/ssh-backup-AAAAMMDD-HHMMSS
+sudo ./ssh-hardening.sh --rollback /root/ssh-backup-YYYYMMDD-HHMMSS
 ```
 
-Restaura a configuração do SSH, remove o jail criado, desbane todos os IPs e reinicia os dois serviços. O pacote fail2ban permanece instalado.
+Restores the SSH configuration, removes the jail it created, unbans every IP and restarts both services. The fail2ban package stays installed.
 
 ---
 
-## Avisos
+## Warnings
 
-Mantenha o console web/VNC do seu provedor acessível durante a primeira execução. É a única saída de emergência que não depende do SSH.
+Keep your provider's web/VNC console reachable during the first run. It's the only emergency exit that doesn't depend on SSH.
 
-O script altera configurações críticas de acesso. Teste em um servidor não-produtivo antes, se possível, e leia a saída do `--dry-run`.
+This script changes critical access settings. Test on a non-production server first if you can, and read the `--dry-run` output.
 
 ---
 
-## Licença
+## License
 
-Distribuído sob a licença MIT. Veja [LICENSE](LICENSE) para o texto completo.
+Distributed under the MIT License. See [LICENSE](LICENSE) for the full text.
 
-A MIT inclui isenção de garantia — relevante aqui, já que o script mexe em configurações que podem cortar seu acesso ao servidor. Isso não substitui os cuidados descritos acima; apenas deixa claro que quem executa assume o risco.
+MIT includes a warranty disclaimer — relevant here, since the script touches settings that can cut off your access to the server. That doesn't replace the precautions described above; it just makes clear that whoever runs it assumes the risk.
