@@ -32,6 +32,51 @@ ssh usuario@ip-do-servidor    # precisa entrar sem pedir senha
 
 ---
 
+## Instalação
+
+**Recomendado** — baixa, você inspeciona, depois executa:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/caiotomich/ssh-hardening-ubuntu/main/ssh-hardening.sh -o ssh-hardening.sh \
+  && less ssh-hardening.sh \
+  && sudo bash ssh-hardening.sh --safety-net 10
+```
+
+**One-liner**, se preferir:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/caiotomich/ssh-hardening-ubuntu/main/ssh-hardening.sh \
+  | sudo bash -s -- --force --safety-net 10
+```
+
+O `-s --` é obrigatório: sem ele o bash interpreta `--force` como opção própria, não do script.
+
+**Ou via git:**
+
+```bash
+git clone https://github.com/caiotomich/ssh-hardening-ubuntu.git
+cd ssh-hardening-ubuntu
+sudo ./ssh-hardening.sh --safety-net 10
+```
+
+### Por que a versão em duas etapas é preferível
+
+Não é purismo. Em `curl | bash`, se a conexão cair no meio do download o bash executa o pedaço que chegou — um script cortado na linha errada aplica metade das mudanças e nunca alcança a validação do `sshd -t`. Num script que mexe no seu acesso SSH, isso importa.
+
+O `curl -o arquivo && bash arquivo` resolve porque o curl retorna código de erro em transferência incompleta e o `&&` impede a execução.
+
+Os outros dois motivos são os de sempre: você roda código como root sem ter lido, e um servidor pode servir conteúdo diferente para `curl` e para navegador.
+
+### Verificar integridade
+
+```bash
+sha256sum ssh-hardening.sh
+```
+
+Compare com o valor publicado em [CHECKSUMS.txt](CHECKSUMS.txt).
+
+---
+
 ## Uso
 
 ```bash
@@ -72,6 +117,7 @@ Se algo der errado e você perder o acesso, é só esperar os 10 minutos: o serv
 | `--only-fail2ban` | Só configura o fail2ban, não altera o sshd |
 | `--ssh-mode MODO` | `normal`, `ddos`, `extra` ou `aggressive` (padrão) |
 | `--allow-ip "IPs"` | IPs ou faixas que o fail2ban nunca deve banir |
+| `--disable-pam` | Aplica `UsePAM no` (leia os riscos abaixo antes) |
 | `-h`, `--help` | Ajuda resumida |
 
 ---
@@ -82,7 +128,7 @@ Se algo der errado e você perder o acesso, é só esperar os 10 minutos: o serv
 
 ```
 /etc/ssh/sshd_config.d/00-hardening.conf   # diretivas do sshd
-/etc/fail2ban/jail.d/00-hardening.local    # jail [sshd] e defaults
+/etc/fail2ban/jail.local                   # jail [sshd] e defaults
 /etc/fail2ban/fail2ban.local               # allowipv6 e retenção do banco
 /root/ssh-backup-AAAAMMDD-HHMMSS/          # backup da config original
 ```
@@ -150,11 +196,42 @@ E o principal: `UsePAM no` não fecha nenhuma porta aqui. Quem permitia senha er
 
 O risco real com PAM existe, mas é outro: `UsePAM yes` combinado com `KbdInteractiveAuthentication yes` permite senha via challenge-response mesmo com `PasswordAuthentication no`. É exatamente por isso que aquela diretiva está no override.
 
+**A flag `--disable-pam` existe mesmo assim**, porque alguns scanners de painel tratam `UsePAM yes` como falha de conformidade e não há meio-termo — a diretiva é binária. Se for exigência, use com rede de proteção e teste antes de fechar a sessão:
+
+```bash
+sudo ./ssh-hardening.sh --disable-pam --safety-net 10
+
+# em outro terminal: login novo por chave precisa funcionar
+ssh usuario@ip
+
+# no servidor: os dois que quebram primeiro
+systemctl --user status      # não pode dar "Failed to connect to bus"
+ulimit -n                    # não pode ter caído para 1024
+```
+
+Sem PAM, o sshd valida a conta lendo `/etc/shadow` diretamente. Contas com senha bloqueada (`!`) — o padrão do usuário `ubuntu` em imagens cloud — se comportam de forma diferente. O banner de boas-vindas e o "Last login" também somem, já que são gerados via PAM.
+
+O fail2ban não é afetado: ele lê os logs do sshd, não passa pelo PAM.
+
 ### Precedência dos arquivos de configuração
 
 No SSH, **o primeiro valor lido vence**. Como `/etc/ssh/sshd_config` começa com `Include /etc/ssh/sshd_config.d/*.conf`, um `50-cloud-init.conf` deixado pelo provedor com `PasswordAuthentication yes` sobrescreve silenciosamente o que você editar no arquivo principal.
 
-Por isso o override usa o prefixo `00-`, e o script ainda comenta as diretivas `yes` conflitantes nos demais arquivos — o que também faz scanners que leem arquivos (em vez do valor efetivo) pararem de acusar o alerta.
+Por isso o override usa o prefixo `00-`, e o script ainda comenta as diretivas `yes` conflitantes nos demais arquivos.
+
+### Espelhamento no arquivo principal
+
+O override sozinho resolve o comportamento real do sshd, mas scanners de painel costumam ler apenas `/etc/ssh/sshd_config` e procurar a linha literal. Sem ela, assumem o padrão do OpenSSH (`yes`) e acusam o alerta mesmo com tudo correto. O script grava os mesmos valores nos dois lugares.
+
+A inserção é feita logo após a linha `Include`, nunca com `>>`. Se o arquivo terminar com um bloco `Match`, o append cairia dentro dele e a diretiva passaria a valer só para aquele grupo — um erro silencioso e comum.
+
+Blocos `Match` existentes são preservados, já que podem ser intencionais. Mas se algum contiver `PasswordAuthentication yes`, o script avisa: senha continua liberada para aquele grupo.
+
+### Ordem de leitura do fail2ban
+
+A configuração vai para `/etc/fail2ban/jail.local`, não para `jail.d/`. A ordem de leitura é `jail.conf` → `jail.d/*.conf` → `jail.local` → `jail.d/*.local`, então um arquivo em `jail.d/` com extensão `.local` sobrescreveria o `jail.local` silenciosamente.
+
+O jail traz `mode = aggressive` e `filter = sshd[mode=aggressive]`, que dizem a mesma coisa. O `mode` é a forma canônica e a que os scanners procuram; o `filter` explícito evita depender da interpolação de variáveis do `jail.conf`.
 
 ### Backend de log no Ubuntu 24.04
 
@@ -214,6 +291,15 @@ ssh -o IdentitiesOnly=yes -i ~/.ssh/sua_chave usuario@ip
 **fail2ban não sobe** — veja `journalctl -u fail2ban -n 50`. A causa mais comum é o `/var/log/auth.log` ausente, tratada automaticamente pelo script.
 
 **Perdi o acesso completamente** — use o console web/VNC do painel do provedor (DigitalOcean, Hetzner, Contabo, etc. todos oferecem). Lá você entra com senha local, independente do SSH, e roda `sudo ./ssh-hardening.sh --rollback /root/ssh-backup-*`.
+
+**O scanner do painel continua acusando alerta** — confirme primeiro o estado real:
+
+```bash
+sudo sshd -T | grep -Ei 'passwordauth|usepam|kbdinteractive'
+sudo fail2ban-client status sshd
+```
+
+Se esses comandos mostram os valores corretos, o servidor está certo e o problema é do painel. Duas causas comuns: o relatório vem de cache e só atualiza no próximo scan, ou o painel gerencia o `sshd_config` por conta própria e reescreve edições externas. No segundo caso, procure o toggle equivalente na interface — mudanças feitas por fora tendem a ser revertidas no próximo deploy de configuração.
 
 ---
 
