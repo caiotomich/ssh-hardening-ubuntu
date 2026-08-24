@@ -1,242 +1,547 @@
-# ssh-hardening.sh
+#!/usr/bin/env bash
+#
+# ssh-hardening.sh - Desativa senha no SSH + configura fail2ban (Ubuntu/Debian)
+#
+# Copyright (c) 2026 Caio Tomich
+# Licenciado sob a MIT License. Veja o arquivo LICENSE.
+#
+# Uso:
+#   sudo ./ssh-hardening.sh                    # aplica com confirmacao
+#   sudo ./ssh-hardening.sh --dry-run          # apenas mostra o que faria
+#   sudo ./ssh-hardening.sh --force            # sem perguntar
+#   sudo ./ssh-hardening.sh --safety-net 10    # reverte sozinho em 10 min
+#   sudo ./ssh-hardening.sh --rollback DIR     # restaura um backup
+#
+#   --skip-fail2ban            nao mexe no fail2ban
+#   --only-fail2ban            so configura o fail2ban, nao toca no sshd
+#   --ssh-mode normal|aggressive   modo do filtro sshd (padrao: aggressive)
+#   --allow-ip "1.2.3.4 5.6.7.0/24"  IPs que o fail2ban nunca bane
+#   --disable-pam              UsePAM no (veja os riscos no README)
+#
+# O safety-net e a rede de protecao: agenda a restauracao automatica do
+# backup. Se voce testar o acesso e estiver tudo certo, cancele o timer
+# com o comando que o script informa no final.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+set -euo pipefail
 
-Desativa autenticação por senha no SSH e configura o fail2ban em servidores Ubuntu/Debian, com verificações que evitam o cenário clássico de perder o acesso ao próprio servidor.
+readonly SSHD_CONFIG="/etc/ssh/sshd_config"
+readonly SSHD_CONFIG_D="/etc/ssh/sshd_config.d"
+readonly OVERRIDE="${SSHD_CONFIG_D}/00-hardening.conf"
+readonly BACKUP_DIR="/root/ssh-backup-$(date +%Y%m%d-%H%M%S)"
+readonly TIMER_UNIT="ssh-hardening-rollback"
 
-Escrito para resolver os alertas típicos de scanners de segurança de painéis de VPS:
+readonly F2B_JAIL="/etc/fail2ban/jail.local"
+readonly F2B_JAIL_OLD="/etc/fail2ban/jail.d/00-hardening.local"
+readonly F2B_LOCAL="/etc/fail2ban/fail2ban.local"
 
-| Item do relatório | Resolvido por |
-|---|---|
-| Password Authentication should be disabled | `PasswordAuthentication no` + `KbdInteractiveAuthentication no` |
-| Fail2Ban should be installed | instalação via `apt` |
-| Fail2Ban service should be enabled | `systemctl enable fail2ban` |
-| Fail2Ban service should be running | `systemctl restart` + verificação de estado |
-| SSH protection should be enabled | jail `[sshd]` com `enabled = true` |
-| Aggressive mode recommended | `filter = sshd[mode=aggressive]` |
+DRY_RUN=0
+FORCE=0
+SAFETY_NET=0
+SKIP_F2B=0
+ONLY_F2B=0
+SSH_MODE="aggressive"
+ALLOW_IP=""
+PAM_VALUE="yes"
 
----
+# ---------- saida ----------
+c_red=$'\033[0;31m'; c_grn=$'\033[0;32m'; c_yel=$'\033[0;33m'
+c_blu=$'\033[0;34m'; c_off=$'\033[0m'
 
-## Requisitos
+info() { printf '%s[INFO]%s %s\n'  "$c_blu" "$c_off" "$*"; }
+ok()   { printf '%s[ OK ]%s %s\n'  "$c_grn" "$c_off" "$*"; }
+warn() { printf '%s[AVISO]%s %s\n' "$c_yel" "$c_off" "$*"; }
+die()  { printf '%s[ERRO]%s %s\n'  "$c_red" "$c_off" "$*" >&2; exit 1; }
 
-- Ubuntu 18.04+ ou Debian 10+
-- Acesso root (`sudo`)
-- **Uma chave pública SSH já instalada** — o script recusa rodar sem isso
+run() {
+    if (( DRY_RUN )); then
+        printf '  %s(dry-run)%s %s\n' "$c_yel" "$c_off" "$*"
+    else
+        "$@"
+    fi
+}
 
-Se ainda não tiver, execute na sua máquina local antes de qualquer coisa:
+# Quando o script chega por 'curl | bash', $0 vale "bash" e nao existe
+# arquivo no disco. Guardamos um nome utilizavel para as mensagens.
+SELF="${BASH_SOURCE[0]:-$0}"
+if [[ -f "$SELF" ]]; then
+    readonly SELF_LABEL="$SELF"
+    readonly PIPED=0
+else
+    readonly SELF_LABEL="./ssh-hardening.sh"
+    readonly PIPED=1
+fi
 
-```bash
-ssh-copy-id usuario@ip-do-servidor
-ssh usuario@ip-do-servidor    # precisa entrar sem pedir senha
-```
+# ---------- argumentos ----------
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dry-run)    DRY_RUN=1; shift ;;
+        --force)      FORCE=1; shift ;;
+        --safety-net) SAFETY_NET="${2:?informe os minutos}"; shift 2 ;;
+        --rollback)   ROLLBACK_DIR="${2:?informe o diretorio de backup}"; shift 2 ;;
+        --skip-fail2ban) SKIP_F2B=1; shift ;;
+        --only-fail2ban) ONLY_F2B=1; shift ;;
+        --ssh-mode)   SSH_MODE="${2:?normal ou aggressive}"; shift 2 ;;
+        --allow-ip)   ALLOW_IP="${2:?informe um ou mais IPs}"; shift 2 ;;
+        --disable-pam) PAM_VALUE="no"; shift ;;
+        -h|--help)
+            if (( PIPED )); then
+                printf 'Baixe o script para ver a ajuda completa:\n  curl -fsSL https://raw.githubusercontent.com/caiotomich/ssh-hardening-ubuntu/main/ssh-hardening.sh -o ssh-hardening.sh && bash ssh-hardening.sh --help\n'
+            else
+                sed -n '3,23p' "$SELF" | sed 's/^# \?//'
+            fi
+            exit 0 ;;
+        *)            die "opcao desconhecida: $1" ;;
+    esac
+done
 
----
+[[ $EUID -eq 0 ]] || die "execute como root (sudo $SELF_LABEL)"
+[[ "$SSH_MODE" =~ ^(normal|ddos|extra|aggressive)$ ]] || die "--ssh-mode invalido: $SSH_MODE"
 
-## Uso
+# Descobre o IP de onde voce esta conectado, para nunca se auto-banir.
+# Atencao: o sudo limpa SSH_CLIENT por padrao (env_reset), entao ha fallbacks.
+detect_client_ip() {
+    local ip=""
+    [[ -n "${SSH_CLIENT:-}" ]]     && ip=$(awk '{print $1}' <<<"$SSH_CLIENT")
+    [[ -z "$ip" && -n "${SSH_CONNECTION:-}" ]] && ip=$(awk '{print $1}' <<<"$SSH_CONNECTION")
+    [[ -z "$ip" ]] && ip=$(who am i 2>/dev/null | sed -nE 's/.*\(([0-9a-fA-F.:]+)\)[[:space:]]*$/\1/p')
+    [[ -z "$ip" ]] && ip=$(last -w -i -n1 "${SUDO_USER:-root}" 2>/dev/null | awk 'NR==1{print $3}')
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$|^[0-9a-fA-F:]+:[0-9a-fA-F:]+$ ]] && printf '%s' "$ip"
+}
 
-```bash
-chmod +x ssh-hardening.sh
+# ---------- rollback manual ----------
+if [[ -n "${ROLLBACK_DIR:-}" ]]; then
+    [[ -d "$ROLLBACK_DIR" ]] || die "backup nao encontrado: $ROLLBACK_DIR"
+    info "Restaurando de $ROLLBACK_DIR"
+    cp -a "$ROLLBACK_DIR/sshd_config" "$SSHD_CONFIG"
+    rm -rf "$SSHD_CONFIG_D"
+    [[ -d "$ROLLBACK_DIR/sshd_config.d" ]] && cp -a "$ROLLBACK_DIR/sshd_config.d" "$SSHD_CONFIG_D"
+    sshd -t || die "config restaurada esta invalida - intervencao manual necessaria"
+    systemctl restart ssh
+    ok "Configuracao SSH restaurada e servico reiniciado."
 
-sudo ./ssh-hardening.sh --dry-run          # ver o que aconteceria
-sudo ./ssh-hardening.sh --safety-net 10    # aplicar com rede de proteção
-```
+    if [[ -f "$F2B_JAIL" || -f "$F2B_JAIL_OLD" ]]; then
+        info "Removendo jail do fail2ban e desbanindo todos os IPs"
+        rm -f "$F2B_JAIL" "$F2B_JAIL_OLD"
+        fail2ban-client unban --all >/dev/null 2>&1 || true
+        systemctl restart fail2ban 2>/dev/null || true
+        ok "fail2ban revertido (pacote mantido instalado)."
+    fi
+    exit 0
+fi
 
-### Fluxo recomendado na primeira execução
+if (( ONLY_F2B )); then
+    info "Modo --only-fail2ban: o sshd nao sera alterado."
+else
 
-1. Rode com `--dry-run` e leia a saída.
-2. Rode com `--safety-net 10`.
-3. **Sem fechar a sessão atual**, abra outro terminal e teste o acesso por chave.
-4. Confirme que a senha foi bloqueada:
-   ```bash
-   ssh -o PubkeyAuthentication=no -o PreferredAuthentications=password usuario@ip
-   ```
-   O esperado é `Permission denied (publickey)`.
-5. Deu tudo certo? Cancele o rollback automático:
-   ```bash
-   sudo systemctl stop ssh-hardening-rollback.timer
-   ```
+# ---------- 1. verificar chaves instaladas ----------
+info "Procurando chaves publicas autorizadas..."
 
-Se algo der errado e você perder o acesso, é só esperar os 10 minutos: o servidor se restaura sozinho.
+declare -a users_with_keys=()
+total_keys=0
 
----
+while IFS= read -r home; do
+    ak="$home/.ssh/authorized_keys"
+    [[ -s "$ak" ]] || continue
+    n=$(grep -cE '^[[:space:]]*(ssh-|ecdsa-|sk-)' "$ak" || true)
+    (( n > 0 )) || continue
+    user=$(basename "$home"); [[ "$home" == "/root" ]] && user="root"
+    users_with_keys+=("$user ($n chave(s))")
+    (( total_keys += n ))
+done < <(printf '%s\n' /root /home/*)
 
-## Opções
+# tambem cobre AuthorizedKeysFile customizado em local central
+if akf=$(sshd -T 2>/dev/null | awk '/^authorizedkeysfile /{$1=""; print}'); then
+    for pat in $akf; do
+        [[ "$pat" == *%u* || "$pat" == .ssh/* ]] && continue
+        [[ -s "$pat" ]] && { users_with_keys+=("$pat (arquivo central)"); (( total_keys++ )); }
+    done
+fi
 
-| Flag | Efeito |
-|---|---|
-| `--dry-run` | Mostra todas as ações sem executar nenhuma |
-| `--force` | Não pede confirmação interativa |
-| `--safety-net N` | Agenda restauração automática do backup em N minutos |
-| `--rollback DIR` | Restaura um backup anterior e reverte o fail2ban |
-| `--skip-fail2ban` | Só mexe no sshd |
-| `--only-fail2ban` | Só configura o fail2ban, não altera o sshd |
-| `--ssh-mode MODO` | `normal`, `ddos`, `extra` ou `aggressive` (padrão) |
-| `--allow-ip "IPs"` | IPs ou faixas que o fail2ban nunca deve banir |
-| `-h`, `--help` | Ajuda resumida |
+if (( total_keys == 0 )); then
+    die "Nenhuma chave publica encontrada. Rode 'ssh-copy-id usuario@servidor'
+       na sua maquina local ANTES de continuar, ou voce ficara sem acesso."
+fi
 
----
+ok "Chaves encontradas:"
+printf '       - %s\n' "${users_with_keys[@]}"
 
-## O que é alterado
+if [[ ! " ${users_with_keys[*]} " =~ [^a-z]root[^a-z] ]] && (( ${#users_with_keys[@]} == 1 )); then
+    warn "Apenas um usuario tem chave. Se perder essa chave, sobra so o console do provedor."
+fi
 
-### Arquivos criados
+# ---------- 2. mostrar estado atual ----------
+info "Estado atual:"
+sshd -T 2>/dev/null | grep -Ei '^(passwordauthentication|kbdinteractiveauthentication|usepam|pubkeyauthentication|permitrootlogin) ' \
+    | sed 's/^/       /' || warn "nao foi possivel ler a config efetiva"
 
-```
-/etc/ssh/sshd_config.d/00-hardening.conf   # diretivas do sshd
-/etc/fail2ban/jail.d/00-hardening.local    # jail [sshd] e defaults
-/etc/fail2ban/fail2ban.local               # allowipv6 e retenção do banco
-/root/ssh-backup-AAAAMMDD-HHMMSS/          # backup da config original
-```
+# ---------- 3. confirmar ----------
+if (( ! FORCE && ! DRY_RUN )); then
+    # Com 'curl | bash' o stdin E o proprio script: um 'read' comum
+    # consumiria linhas de codigo como se fossem a sua resposta.
+    if [[ -r /dev/tty ]]; then
+        printf '\n%sDesativar autenticacao por senha agora? [s/N]%s ' "$c_yel" "$c_off" > /dev/tty
+        read -r resp < /dev/tty
+    elif (( PIPED )); then
+        die "Sem terminal para confirmar. Use --force ou baixe o script antes:
+       curl -fsSL https://raw.githubusercontent.com/caiotomich/ssh-hardening-ubuntu/main/ssh-hardening.sh -o ssh-hardening.sh && sudo bash ssh-hardening.sh"
+    else
+        printf '\n%sDesativar autenticacao por senha agora? [s/N]%s ' "$c_yel" "$c_off"
+        read -r resp
+    fi
+    [[ "$resp" =~ ^[sSyY]$ ]] || { info "Cancelado."; exit 0; }
+fi
 
-O script **nunca edita** `jail.conf` nem `fail2ban.conf` — esses arquivos são sobrescritos a cada atualização do pacote.
+# ---------- 4. backup ----------
+info "Backup em $BACKUP_DIR"
+run mkdir -p "$BACKUP_DIR"
+run cp -a "$SSHD_CONFIG" "$BACKUP_DIR/"
+[[ -d "$SSHD_CONFIG_D" ]] && run cp -a "$SSHD_CONFIG_D" "$BACKUP_DIR/"
 
-### Configuração aplicada ao sshd
+# ---------- 5. neutralizar diretivas conflitantes ----------
+# No SSH o PRIMEIRO valor lido vence. Comentamos os "yes" espalhados
+# (ex: 50-cloud-init.conf) para evitar surpresa e para satisfazer
+# scanners que leem os arquivos em vez do valor efetivo.
+info "Neutralizando diretivas conflitantes..."
+shopt -s nullglob
+for f in "$SSHD_CONFIG_D"/*.conf; do
+    [[ "$f" == "$OVERRIDE" ]] && continue
+    if grep -qiE '^[[:space:]]*(PasswordAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication)[[:space:]]+yes' "$f"; then
+        info "  ajustando $f"
+        run sed -i -E 's/^([[:space:]]*(PasswordAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication)[[:space:]]+yes)/#\1  # desativado por ssh-hardening.sh/I' "$f"
+    fi
+done
+shopt -u nullglob
 
-```
+# ---------- 6. escrever override ----------
+HAS_INCLUDE=0
+grep -qiE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/' "$SSHD_CONFIG" && HAS_INCLUDE=1
+
+if (( HAS_INCLUDE )); then
+    info "Escrevendo $OVERRIDE"
+    run mkdir -p "$SSHD_CONFIG_D"
+    if (( DRY_RUN )); then
+        printf '  %s(dry-run)%s conteudo do override\n' "$c_yel" "$c_off"
+    else
+        cat > "$OVERRIDE" <<EOF
+# Gerado por ssh-hardening.sh
+# Prefixo 00- garante precedencia sobre 50-cloud-init.conf e afins.
+
 PasswordAuthentication no
 KbdInteractiveAuthentication no
 PubkeyAuthentication yes
 PermitRootLogin prohibit-password
 AuthenticationMethods publickey
-UsePAM yes
-```
+UsePAM $PAM_VALUE
+EOF
+        chmod 600 "$OVERRIDE"
+    fi
+fi
 
-### Configuração aplicada ao fail2ban
+# 6b. Espelhar os valores DENTRO do sshd_config principal.
+#
+# Por que: o override acima ja resolve o comportamento real do sshd, mas
+# scanners de painel costumam ler apenas /etc/ssh/sshd_config e procurar a
+# linha literal. Sem ela, assumem o padrao do OpenSSH (yes) e acusam o alerta
+# mesmo com tudo correto.
+#
+# Cuidado importante: NAO usar >> para acrescentar. Se o arquivo terminar com
+# um bloco "Match", o append cai dentro dele e a diretiva passa a valer so
+# para aquele grupo. Por isso inserimos logo apos o Include e removemos
+# ocorrencias antigas apenas antes do primeiro Match.
+info "Espelhando diretivas em $SSHD_CONFIG (para scanners que leem o arquivo)"
 
-```ini
+if (( ! DRY_RUN )); then
+    blk="# ssh-hardening.sh - valores explicitos
+# (o override em sshd_config.d/ tem precedencia; estes sao identicos)
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+PubkeyAuthentication yes
+PermitRootLogin prohibit-password
+UsePAM $PAM_VALUE"
+
+    tmp=$(mktemp)
+    awk -v blk="$blk" -v has_inc="$HAS_INCLUDE" '
+        BEGIN { ins = 0; inmatch = 0 }
+        NR == 1 && !has_inc { print blk; print ""; ins = 1 }
+        /^[[:space:]]*[Mm]atch[[:space:]]+/ { inmatch = 1 }
+        {
+            if (!inmatch) {
+                k = tolower($1); sub(/^#+/, "", k)
+                if (k == "passwordauthentication" || k == "kbdinteractiveauthentication" ||
+                    k == "challengeresponseauthentication" || k == "usepam" ||
+                    k == "pubkeyauthentication" || k == "permitrootlogin") next
+            }
+            print
+            if (!ins && $0 ~ /^[[:space:]]*[Ii]nclude[[:space:]]+\/etc\/ssh\/sshd_config\.d\//) {
+                print ""; print blk; ins = 1
+            }
+        }
+    ' "$SSHD_CONFIG" > "$tmp"
+
+    if [[ -s "$tmp" ]] && grep -q '^PasswordAuthentication no' "$tmp"; then
+        cat "$tmp" > "$SSHD_CONFIG"
+        ok "  diretivas gravadas no arquivo principal"
+    else
+        warn "  falha ao reescrever - mantendo o original"
+    fi
+    rm -f "$tmp"
+fi
+
+# Blocos Match sao preservados de proposito (podem ser intencionais), mas
+# um Match com PasswordAuthentication yes reabre senha para aquele grupo.
+if (( ! DRY_RUN )) && awk '/^[[:space:]]*[Mm]atch[[:space:]]+/{m=1} m && tolower($1)=="passwordauthentication" && tolower($2)=="yes"{found=1} END{exit !found}' "$SSHD_CONFIG"; then
+    warn "Existe um bloco Match com PasswordAuthentication yes em $SSHD_CONFIG."
+    warn "Senha continua permitida para aquele grupo. Revise manualmente."
+fi
+
+if [[ "$PAM_VALUE" == "no" ]]; then
+    warn "UsePAM=no aplicado. TESTE antes de fechar a sessao:"
+    warn "  systemctl --user status   e   ulimit -n"
+fi
+
+# ---------- 7. validar ----------
+info "Validando sintaxe..."
+if (( ! DRY_RUN )); then
+    if ! sshd -t 2>/tmp/sshd-test.err; then
+        warn "Sintaxe invalida. Revertendo automaticamente."
+        cp -a "$BACKUP_DIR/sshd_config" "$SSHD_CONFIG"
+        rm -rf "$SSHD_CONFIG_D"
+        [[ -d "$BACKUP_DIR/sshd_config.d" ]] && cp -a "$BACKUP_DIR/sshd_config.d" "$SSHD_CONFIG_D"
+        cat /tmp/sshd-test.err >&2
+        die "nada foi alterado"
+    fi
+fi
+ok "Sintaxe valida."
+
+# ---------- 8. rede de protecao ----------
+if (( SAFETY_NET > 0 && ! DRY_RUN )); then
+    systemd-run --unit="$TIMER_UNIT" --on-active="${SAFETY_NET}m" \
+        /bin/bash -c "cp -a '$BACKUP_DIR/sshd_config' '$SSHD_CONFIG'; \
+                      rm -rf '$SSHD_CONFIG_D'; \
+                      [ -d '$BACKUP_DIR/sshd_config.d' ] && cp -a '$BACKUP_DIR/sshd_config.d' '$SSHD_CONFIG_D'; \
+                      systemctl restart ssh" >/dev/null 2>&1
+    warn "Rollback automatico agendado para daqui a ${SAFETY_NET} minuto(s)."
+fi
+
+# ---------- 9. reiniciar ----------
+info "Reiniciando SSH (conexoes ativas nao caem)..."
+if systemctl is-active --quiet ssh.socket 2>/dev/null; then
+    run systemctl restart ssh.socket   # Ubuntu 24.04+ (socket-activated)
+    run systemctl restart ssh || true
+else
+    run systemctl restart ssh
+fi
+ok "SSH reiniciado."
+
+# ---------- 10. verificar resultado ----------
+if (( ! DRY_RUN )); then
+    printf '\n'
+    info "Configuracao efetiva agora:"
+    eff=$(sshd -T | grep -Ei '^(passwordauthentication|kbdinteractiveauthentication|usepam|pubkeyauthentication|permitrootlogin) ')
+    printf '%s\n' "$eff" | sed 's/^/       /'
+
+    if grep -qi '^passwordauthentication no' <<<"$eff" \
+    && grep -qi '^kbdinteractiveauthentication no' <<<"$eff"; then
+        ok "Autenticacao por senha DESATIVADA."
+    else
+        warn "Algo ainda permite senha. Revise: grep -ri passwordauth /etc/ssh/"
+    fi
+fi
+
+fi   # <-- fim do bloco sshd (--only-fail2ban pula tudo acima)
+
+# ---------- 11. fail2ban ----------
+setup_fail2ban() {
+    local ver backend_line banaction ignore ip ports nregex
+
+    # 11.1 instalacao
+    if command -v fail2ban-server >/dev/null 2>&1; then
+        ver=$(fail2ban-server --version 2>/dev/null | head -1)
+        ok "  ja instalado: ${ver:-versao desconhecida}"
+    else
+        info "  instalando pacote fail2ban..."
+        run env DEBIAN_FRONTEND=noninteractive apt-get update -qq
+        run env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq fail2ban
+    fi
+
+    # 11.2 fonte dos logs
+    # Imagens minimas do Ubuntu 24.04 nao trazem rsyslog: /var/log/auth.log
+    # nao existe e o jail sshd morre com "Have not found any log file".
+    if [[ -f /var/log/auth.log ]]; then
+        backend_line="backend  = auto"
+    else
+        warn "  /var/log/auth.log ausente - lendo direto do journal"
+        run env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-systemd
+        backend_line="backend  = systemd"
+    fi
+
+    # 11.3 como banir
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi '^status: active'; then
+        banaction="ufw"
+        info "  ufw ativo - banimentos entram como regra ufw"
+    else
+        banaction="iptables-multiport"
+    fi
+
+    # 11.4 porta real do sshd (nao assume 22)
+    ports=$(sshd -T 2>/dev/null | awk '/^port /{print $2}' | paste -sd, -)
+    [[ -z "$ports" ]] && ports="ssh"
+    info "  porta(s) monitorada(s): $ports"
+
+    # 11.5 whitelist - o equivalente a "nao se trancar do lado de fora"
+    ignore="127.0.0.1/8 ::1"
+    ip=$(detect_client_ip || true)
+    if [[ -n "$ip" ]]; then
+        ignore="$ignore $ip"
+        ok "  seu IP atual ($ip) entrou na whitelist"
+    else
+        warn "  nao identifiquei seu IP - rode com --allow-ip \"SEU.IP\" se tiver IP fixo"
+    fi
+    [[ -n "$ALLOW_IP" ]] && ignore="$ignore $ALLOW_IP"
+
+    # 11.6 arquivos de configuracao
+    # Nunca editar jail.conf/fail2ban.conf: sao sobrescritos em cada upgrade.
+    if (( DRY_RUN )); then
+        printf '  %s(dry-run)%s escreveria %s e %s\n' "$c_yel" "$c_off" "$F2B_LOCAL" "$F2B_JAIL"
+    else
+        cat > "$F2B_LOCAL" <<EOF
+# Gerado por ssh-hardening.sh
+[Definition]
+allowipv6  = auto
+# Retencao maior no banco: necessaria para o bantime incremental funcionar.
+dbpurgeage = 30d
+EOF
+
+        mkdir -p /etc/fail2ban/jail.d
+        # Remove o local antigo (jail.d) para nao existirem duas fontes.
+        # Ordem de leitura do fail2ban: jail.conf -> jail.d/*.conf ->
+        # jail.local -> jail.d/*.local. Um arquivo em jail.d/*.local
+        # sobrescreveria o jail.local silenciosamente.
+        rm -f "$F2B_JAIL_OLD"
+
+        cat > "$F2B_JAIL" <<EOF
+# Gerado por ssh-hardening.sh
 [DEFAULT]
+ignoreip  = $ignore
 bantime   = 1h
 findtime  = 10m
 maxretry  = 5
-bantime.increment = true    # 1h → 2h → 4h ... até 1 semana
+banaction = $banaction
+
+# Reincidente apanha mais: 1h -> 2h -> 4h ... ate 1 semana.
+bantime.increment = true
 bantime.factor    = 2
 bantime.maxtime   = 1w
 
 [sshd]
 enabled  = true
+port     = $ports
 maxretry = 3
-filter   = sshd[mode=aggressive]
-```
+$backend_line
 
----
+# As duas linhas abaixo dizem a mesma coisa de propositos diferentes:
+# 'mode' e a forma canonica (e a que scanners de painel procuram);
+# 'filter' torna explicito, sem depender da interpolacao do jail.conf.
+# normal | ddos | extra | aggressive
+mode     = $SSH_MODE
+filter   = sshd[mode=$SSH_MODE]
+EOF
+        chmod 644 "$F2B_JAIL" "$F2B_LOCAL"
+    fi
 
-## Proteções contra lockout
+    # 11.7 validar antes de subir
+    if (( ! DRY_RUN )); then
+        if ! fail2ban-client -t >/tmp/f2b-test.log 2>&1; then
+            warn "  configuracao do fail2ban invalida - removendo o jail criado"
+            rm -f "$F2B_JAIL"
+            tail -20 /tmp/f2b-test.log >&2
+            return 1
+        fi
+        ok "  configuracao valida"
+    fi
 
-O script foi construído em torno da premissa de que a falha mais provável não é um invasor — é você mesmo se trancando para fora.
+    # 11.8 habilitar e iniciar
+    run systemctl enable --quiet fail2ban 2>/dev/null || run systemctl enable fail2ban
+    run systemctl restart fail2ban
 
-**Verificação de chaves antes de tudo.** Ele varre `/root` e `/home/*` procurando `authorized_keys` com pelo menos uma chave válida, e também respeita `AuthorizedKeysFile` customizado. Sem nenhuma chave, aborta antes de tocar em qualquer arquivo.
+    if (( DRY_RUN )); then return 0; fi
 
-**Backup e validação.** Toda a configuração vai para `/root/ssh-backup-*` antes de qualquer edição. Se o `sshd -t` reprovar a sintaxe, o script restaura sozinho e sai sem reiniciar o serviço.
+    sleep 2
+    if ! systemctl is-active --quiet fail2ban; then
+        warn "  fail2ban nao subiu. Ultimas linhas do log:"
+        journalctl -u fail2ban -n 20 --no-pager | sed 's/^/       /' >&2
+        return 1
+    fi
+    ok "  servico ativo e habilitado no boot"
 
-**Rede de proteção temporizada.** Com `--safety-net N`, um `systemd-run` agenda a restauração do backup para daqui a N minutos. Você cancela manualmente depois de confirmar que o acesso funciona.
+    # 11.9 conferir o jail
+    if fail2ban-client status sshd >/tmp/f2b-status.log 2>&1; then
+        sed 's/^/       /' /tmp/f2b-status.log
+        nregex=$(fail2ban-client get sshd failregex 2>/dev/null | grep -cE '^[|`]' || true)
+        info "  filtro sshd carregado com ${nregex:-0} expressoes (modo $SSH_MODE)"
+    else
+        warn "  jail sshd nao esta ativo:"
+        sed 's/^/       /' /tmp/f2b-status.log >&2
+        return 1
+    fi
+}
 
-**Whitelist automática no fail2ban.** O IP da sua sessão atual entra no `ignoreip`. Como o `sudo` limpa `SSH_CLIENT` por padrão (`env_reset`), há três fallbacks encadeados: `SSH_CONNECTION`, `who am i` e `last`. Se nenhum funcionar, o script avisa e sugere `--allow-ip`.
+F2B_OK=0
+if (( SKIP_F2B )); then
+    info "fail2ban ignorado (--skip-fail2ban)"
+else
+    printf '\n'
+    info "Configurando fail2ban..."
+    if setup_fail2ban; then
+        F2B_OK=1
+        (( DRY_RUN )) || ok "fail2ban configurado e protegendo o SSH."
+    else
+        warn "fail2ban NAO ficou operante. O SSH continua protegido por chave,"
+        warn "mas resolva isso: journalctl -u fail2ban -n 50"
+    fi
+fi
 
----
+# ---------- 12. instrucoes finais ----------
+cat <<EOF
 
-## Decisões técnicas
+${c_yel}NAO FECHE ESTA SESSAO AINDA.${c_off}
 
-Algumas escolhas do script contrariam checklists genéricos que circulam pela internet. Vale entender o porquê.
+1) Em OUTRO terminal, teste que a chave funciona:
+     ssh $(id -un 2>/dev/null || echo usuario)@<ip>
 
-### `UsePAM yes` é mantido de propósito
+2) Confirme que a senha foi bloqueada (deve dar "Permission denied"):
+     ssh -o PubkeyAuthentication=no -o PreferredAuthentications=password usuario@<ip>
 
-Muitos guias mandam desativar o PAM quando se usa autenticação por chave. No Ubuntu isso é contraproducente, e o próprio CIS Benchmark recomenda `UsePAM yes`. Ao desativar, você perde:
+EOF
 
-- **pam_systemd** — sem registro no `loginctl` e sem `XDG_RUNTIME_DIR`, o que quebra `systemctl --user` e derruba serviços de usuário na desconexão
-- **pam_limits** — `/etc/security/limits.conf` deixa de valer (`nofile`, `nproc`), o que costuma reaparecer depois como "too many open files"
-- **Expiração e bloqueio de contas**, `/etc/nologin`, motd, faillock
-- **SSSD, LDAP ou Kerberos**, se você usar
+if (( SAFETY_NET > 0 && ! DRY_RUN )); then
+    cat <<EOF
+3) Deu tudo certo? Cancele o rollback automatico:
+     sudo systemctl stop ${TIMER_UNIT}.timer
 
-E o principal: `UsePAM no` não fecha nenhuma porta aqui. Quem permitia senha era o `KbdInteractiveAuthentication`, já desativado. O PAM cuida de sessão e validação de conta, não do método de autenticação.
+EOF
+fi
 
-O risco real com PAM existe, mas é outro: `UsePAM yes` combinado com `KbdInteractiveAuthentication yes` permite senha via challenge-response mesmo com `PasswordAuthentication no`. É exatamente por isso que aquela diretiva está no override.
+if (( F2B_OK )); then
+    cat <<EOF
+Comandos uteis do fail2ban:
+  sudo fail2ban-client status sshd          # quantos IPs banidos
+  sudo fail2ban-client set sshd unbanip IP  # tirar um IP do ban
+  sudo fail2ban-client unban --all          # limpar tudo (emergencia)
+  sudo tail -f /var/log/fail2ban.log        # acompanhar em tempo real
 
-### Precedência dos arquivos de configuração
+Dica: se o seu cliente oferece varias chaves ao conectar, ele pode estourar
+o MaxAuthTries e voce mesmo levar um ban. Evite com:
+  ssh -o IdentitiesOnly=yes -i ~/.ssh/sua_chave usuario@<ip>
 
-No SSH, **o primeiro valor lido vence**. Como `/etc/ssh/sshd_config` começa com `Include /etc/ssh/sshd_config.d/*.conf`, um `50-cloud-init.conf` deixado pelo provedor com `PasswordAuthentication yes` sobrescreve silenciosamente o que você editar no arquivo principal.
+EOF
+fi
 
-Por isso o override usa o prefixo `00-`, e o script ainda comenta as diretivas `yes` conflitantes nos demais arquivos — o que também faz scanners que leem arquivos (em vez do valor efetivo) pararem de acusar o alerta.
+(( ONLY_F2B )) && exit 0
 
-### Backend de log no Ubuntu 24.04
-
-As imagens minimais do Ubuntu 24.04 não trazem mais o rsyslog, então `/var/log/auth.log` não existe. O jail `sshd` do fail2ban falha com *"Have not found any log file"* — o serviço sobe, o scanner marca como "Installed e Active", mas nada está sendo protegido.
-
-O script detecta a ausência do arquivo, instala `python3-systemd` e configura `backend = systemd` para ler direto do journal.
-
-### Porta lida do sshd, não presumida
-
-O jail usa a porta real obtida de `sshd -T`, em vez do `port = ssh` padrão. Se você moveu o SSH para outra porta, o padrão monitoraria a porta 22 sem avisar.
-
-### Sobre o modo aggressive
-
-É o padrão porque é o que os scanners pedem, mas vale calibrar a expectativa.
-
-O modo `aggressive` soma os filtros `ddos` e `extra`, banindo também quem abre e fecha conexão sem chegar a autenticar. Com a senha já desativada, o ganho real é **reduzir ruído de log**, não impedir invasão — nenhum bot vai adivinhar uma chave Ed25519 por força bruta.
-
-O risco está do outro lado. Se houver health-check de load balancer ou monitoramento tocando na porta SSH, o modo aggressive vai banir sua própria infraestrutura. Nesses casos:
-
-```bash
-sudo ./ssh-hardening.sh --ssh-mode normal
-# ou
-sudo ./ssh-hardening.sh --allow-ip "10.0.0.0/8"
-```
-
----
-
-## Verificação manual
-
-```bash
-# valores efetivos do sshd (não o que está escrito nos arquivos)
-sudo sshd -T | grep -Ei "passwordauth|kbdinteractive|usepam|pubkeyauth|permitroot"
-
-# procurar diretivas conflitantes espalhadas
-sudo grep -ri "passwordauthentication" /etc/ssh/
-
-# estado do fail2ban
-sudo fail2ban-client status
-sudo fail2ban-client status sshd
-```
-
-Estado saudável: `passwordauthentication no`, `kbdinteractiveauthentication no`, `usepam yes`, `pubkeyauthentication yes`.
-
----
-
-## Problemas comuns
-
-**"Nenhuma chave publica encontrada"** — rode `ssh-copy-id` na máquina local antes. É a proteção funcionando.
-
-**Fui banido pelo meu próprio fail2ban** — entre pelo console web/VNC do provedor e execute `fail2ban-client set sshd unbanip SEU.IP`. Depois adicione seu IP com `--allow-ip`.
-
-**Meu cliente SSH leva ban ao conectar** — se o agente oferece várias chaves, o `MaxAuthTries` (padrão 6) estoura e conta como tentativas falhas. Force uma chave só:
-```bash
-ssh -o IdentitiesOnly=yes -i ~/.ssh/sua_chave usuario@ip
-```
-
-**fail2ban não sobe** — veja `journalctl -u fail2ban -n 50`. A causa mais comum é o `/var/log/auth.log` ausente, tratada automaticamente pelo script.
-
-**Perdi o acesso completamente** — use o console web/VNC do painel do provedor (DigitalOcean, Hetzner, Contabo, etc. todos oferecem). Lá você entra com senha local, independente do SSH, e roda `sudo ./ssh-hardening.sh --rollback /root/ssh-backup-*`.
-
----
-
-## Reverter
-
-```bash
-sudo ./ssh-hardening.sh --rollback /root/ssh-backup-AAAAMMDD-HHMMSS
-```
-
-Restaura a configuração do SSH, remove o jail criado, desbane todos os IPs e reinicia os dois serviços. O pacote fail2ban permanece instalado.
-
----
-
-## Avisos
-
-Mantenha o console web/VNC do seu provedor acessível durante a primeira execução. É a única saída de emergência que não depende do SSH.
-
-O script altera configurações críticas de acesso. Teste em um servidor não-produtivo antes, se possível, e leia a saída do `--dry-run`.
-
----
-
-## Licença
-
-Distribuído sob a licença MIT. Veja [LICENSE](LICENSE) para o texto completo.
-
-A MIT inclui isenção de garantia — relevante aqui, já que o script mexe em configurações que podem cortar seu acesso ao servidor. Isso não substitui os cuidados descritos acima; apenas deixa claro que quem executa assume o risco.
+cat <<EOF
+Backup salvo em: $BACKUP_DIR
+Reverter manualmente:
+  sudo $SELF_LABEL --rollback $BACKUP_DIR
+EOF
