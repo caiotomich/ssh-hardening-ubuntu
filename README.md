@@ -9,11 +9,13 @@ Written to clear the alerts typical VPS panel security scanners raise:
 | Scanner item | Fixed by |
 |---|---|
 | Password Authentication should be disabled | `PasswordAuthentication no` + `KbdInteractiveAuthentication no` |
+| Default Incoming should be set to 'deny' | `ufw default deny incoming` (with `--enable-ufw`) |
 | Fail2Ban should be installed | installation via `apt` |
 | Fail2Ban service should be enabled | `systemctl enable fail2ban` |
 | Fail2Ban service should be running | `systemctl restart` + state verification |
 | SSH protection should be enabled | `[sshd]` jail with `enabled = true` |
 | Aggressive mode recommended | `mode = aggressive` |
+
 
 ---
 
@@ -37,10 +39,17 @@ ssh user@server-ip    # must log in without asking for a password
 **Recommended** — download, inspect, then run:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/caiotomich/ssh-hardening-ubuntu/main/ssh-hardening.sh -o ssh-hardening.sh \
-  && less ssh-hardening.sh \
-  && sudo bash ssh-hardening.sh --safety-net 10
+# 1. download
+curl -fsSL https://raw.githubusercontent.com/caiotomich/ssh-hardening-ubuntu/main/ssh-hardening.sh -o ssh-hardening.sh
+
+# 2. read it (q quits the pager)
+less ssh-hardening.sh
+
+# 3. run it
+sudo bash ssh-hardening.sh --safety-net 10
 ```
+
+Three separate commands on purpose. Chaining them with `&&` would defeat the point: quitting the pager exits with status 0, so the script would run whether or not you liked what you read.
 
 **One-liner**, if you prefer:
 
@@ -118,6 +127,9 @@ If something goes wrong and you lose access, just wait out the 10 minutes — th
 | `--ssh-mode MODE` | `normal`, `ddos`, `extra` or `aggressive` (default) |
 | `--allow-ip "IPs"` | IPs or ranges fail2ban must never ban |
 | `--disable-pam` | Applies `UsePAM no` (read the risks below first) |
+| `--enable-ufw` | Enables ufw with `default deny incoming` |
+| `--allow-port N` | Opens inbound TCP port N. Repeatable. Implies `--enable-ufw` |
+| `--docker-group [USER]` | Adds USER to the docker group (default: `$SUDO_USER`) |
 | `-h`, `--help` | Short help |
 
 ---
@@ -145,6 +157,48 @@ PermitRootLogin prohibit-password
 AuthenticationMethods publickey
 UsePAM yes
 ```
+
+### Firewall (ufw)
+
+Off by default — enable it explicitly:
+
+```bash
+# firewall with everything inbound denied except SSH
+sudo ./ssh-hardening.sh --enable-ufw --safety-net 10
+
+# web server: also open 80 and 443
+sudo ./ssh-hardening.sh --enable-ufw --allow-port 80 --allow-port 443 --safety-net 10
+```
+
+`--allow-port` implies `--enable-ufw`, since opening a port in a firewall that isn't running means nothing.
+
+Rules applied:
+
+```
+default deny incoming
+default allow outgoing
+allow <sshd's real port>/tcp
+allow <each --allow-port>/tcp
+```
+
+Ports are opened for TCP only. For UDP or anything more specific, use `ufw allow` directly after the run.
+
+### Docker group
+
+```bash
+sudo ./ssh-hardening.sh --docker-group          # adds the invoking user
+sudo ./ssh-hardening.sh --docker-group deploy   # adds a specific user
+```
+
+Equivalent to `usermod -aG docker $USER`, with three differences that matter.
+
+**It uses `$SUDO_USER`, not `$USER`.** Under sudo, `env_reset` sets `USER=root`, so the literal command adds *root* to the docker group — pointless, and it silently fails to add the user you meant.
+
+**It checks before acting.** If the `docker` group doesn't exist, the user doesn't exist, or they're already a member, it says so and moves on instead of erroring out mid-run.
+
+**It tells you what you just granted.** The docker group is root-equivalent: a member can mount the host filesystem inside a container and escape to root. That's a legitimate trade-off, but worth stating out loud in a script otherwise dedicated to reducing privilege.
+
+Membership applies to new sessions only — log out and back in.
 
 ### fail2ban configuration applied
 
@@ -176,6 +230,10 @@ The script is built around the assumption that the likeliest failure isn't an at
 **Timed safety net.** With `--safety-net N`, a `systemd-run` unit schedules a backup restore N minutes out. You cancel it manually once you've confirmed access works.
 
 **Automatic fail2ban whitelist.** Your current session's IP goes into `ignoreip`. Since sudo clears `SSH_CLIENT` by default (`env_reset`), there are three chained fallbacks: `SSH_CONNECTION`, `who am i` and `last`. If none work, the script warns and suggests `--allow-ip`.
+
+**SSH rule before the firewall goes up.** Turning on `default deny incoming` without an SSH rule in place is an instant lockout. The script reads the real port from `sshd -T`, adds the allow rule, verifies it registered with `ufw show added`, and only then runs `ufw --force enable`. If the rule doesn't register, ufw is left off rather than enabled blind.
+
+**The safety net covers the firewall too.** If the script was the one that enabled ufw, it drops a marker in the backup directory. The scheduled rollback checks for that marker and disables ufw along with restoring the SSH config — otherwise restoring `sshd_config` would be useless while the firewall kept blocking. A ufw that was already running before the script ran is never touched.
 
 ---
 
@@ -233,6 +291,31 @@ Configuration goes to `/etc/fail2ban/jail.local`, not `jail.d/`. The read order 
 
 The jail carries both `mode = aggressive` and `filter = sshd[mode=aggressive]`, which say the same thing. `mode` is the canonical form and what scanners look for; the explicit `filter` avoids depending on `jail.conf` variable interpolation.
 
+### Docker bypasses ufw
+
+If Docker is installed, the script prints a warning when enabling the firewall, because `deny incoming` does not do what it looks like it does.
+
+Docker writes its own rules into the `nat` table's `PREROUTING` chain, which is evaluated *before* ufw's chains. A container published with `-p 8080:80` stays reachable from the internet with the firewall fully active. Worse for compliance purposes: the scanner reports "Default Incoming: deny" as passing while those ports are wide open.
+
+Publish on loopback and put a reverse proxy in front:
+
+```bash
+docker run -p 127.0.0.1:8080:80 ...
+```
+
+```yaml
+ports:
+  - "127.0.0.1:8080:80"
+```
+
+To check what is actually exposed, `ufw status` won't tell you — use `sudo iptables -t nat -L DOCKER -n`. Rules that need to apply to container traffic belong in the `DOCKER-USER` chain, the only one evaluated before Docker's.
+
+### ufw runs before fail2ban
+
+Order matters. The fail2ban section picks its `banaction` based on whether ufw is active: with a live firewall it uses `banaction = ufw`, so bans become ufw rules instead of a separate iptables chain. Configuring ufw afterwards would leave fail2ban writing to the wrong place.
+
+The two are not redundant. ufw decides which ports are reachable at all; fail2ban decides who gets cut off after repeated failures on a port that is open.
+
 ### Port read from sshd, not assumed
 
 The jail uses the real port from `sshd -T` instead of the default `port = ssh`. If you moved SSH elsewhere, the default would silently monitor port 22.
@@ -265,6 +348,9 @@ sudo grep -ri "passwordauthentication" /etc/ssh/
 # fail2ban state
 sudo fail2ban-client status
 sudo fail2ban-client status sshd
+
+# firewall state
+sudo ufw status verbose
 ```
 
 A healthy state: `passwordauthentication no`, `kbdinteractiveauthentication no`, `usepam yes`, `pubkeyauthentication yes`.
@@ -283,6 +369,16 @@ ssh -o IdentitiesOnly=yes -i ~/.ssh/your_key user@ip
 ```
 
 **fail2ban won't start** — check `journalctl -u fail2ban -n 50`. The most common cause is a missing `/var/log/auth.log`, which the script handles automatically.
+
+**ufw locked me out** — if you used `--safety-net`, wait it out: the scheduled rollback disables ufw and restores the SSH config. Otherwise use your provider's console and run `sudo ufw disable`.
+
+**`docker` command says permission denied after `--docker-group`** — group membership is resolved at login. Log out and back in, or run `newgrp docker` for the current shell.
+
+**A service stopped responding after enabling ufw** — expected. Everything inbound is denied except SSH and whatever you passed to `--allow-port`. Open what you need:
+```bash
+sudo ufw allow 3306/tcp
+sudo ufw status verbose
+```
 
 **I lost access completely** — use your provider's web/VNC console (DigitalOcean, Hetzner, Contabo and others all offer one). It logs you in with a local password, independent of SSH, and you can run `sudo ./ssh-hardening.sh --rollback /root/ssh-backup-*`.
 
@@ -303,7 +399,7 @@ If those show the correct values, the server is fine and the problem is the pane
 sudo ./ssh-hardening.sh --rollback /root/ssh-backup-YYYYMMDD-HHMMSS
 ```
 
-Restores the SSH configuration, removes the jail it created, unbans every IP and restarts both services. The fail2ban package stays installed.
+Restores the SSH configuration, removes the jail it created, unbans every IP and restarts both services. If the script was the one that enabled ufw, the firewall is disabled too; a ufw that predates the run is left alone. Packages stay installed.
 
 ---
 
