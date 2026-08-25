@@ -1,0 +1,5 @@
+#!/bin/sh
+case "$*" in
+  *-T*) echo "port 22"; echo "authorizedkeysfile .ssh/authorized_keys" ;;
+  *-t*) exit 0 ;;
+esac

@@ -1,21 +1,21 @@
 # ssh-hardening.sh
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![tests](https://github.com/caiotomich/ssh-hardening-ubuntu/actions/workflows/tests.yml/badge.svg)](https://github.com/caiotomich/ssh-hardening-ubuntu/actions/workflows/tests.yml)
 
 Disables SSH password authentication and configures fail2ban on Ubuntu/Debian servers, with the checks that keep you from locking yourself out of your own machine.
 
 Written to clear the alerts typical VPS panel security scanners raise:
 
-| Scanner item | Fixed by |
-|---|---|
+| Scanner item                               | Fixed by                                                        |
+| ------------------------------------------ | --------------------------------------------------------------- |
 | Password Authentication should be disabled | `PasswordAuthentication no` + `KbdInteractiveAuthentication no` |
-| Default Incoming should be set to 'deny' | `ufw default deny incoming` (with `--enable-ufw`) |
-| Fail2Ban should be installed | installation via `apt` |
-| Fail2Ban service should be enabled | `systemctl enable fail2ban` |
-| Fail2Ban service should be running | `systemctl restart` + state verification |
-| SSH protection should be enabled | `[sshd]` jail with `enabled = true` |
-| Aggressive mode recommended | `mode = aggressive` |
-
+| Default Incoming should be set to 'deny'   | `ufw default deny incoming` (with `--enable-ufw`)               |
+| Fail2Ban should be installed               | installation via `apt`                                          |
+| Fail2Ban service should be enabled         | `systemctl enable fail2ban`                                     |
+| Fail2Ban service should be running         | `systemctl restart` + state verification                        |
+| SSH protection should be enabled           | `[sshd]` jail with `enabled = true`                             |
+| Aggressive mode recommended                | `mode = aggressive`                                             |
 
 ---
 
@@ -27,7 +27,7 @@ Written to clear the alerts typical VPS panel security scanners raise:
 
 If you don't have one yet, run this on your local machine first:
 
-```bash
+```
 ssh-copy-id user@server-ip
 ssh user@server-ip    # must log in without asking for a password
 ```
@@ -38,7 +38,7 @@ ssh user@server-ip    # must log in without asking for a password
 
 **Recommended** — download, inspect, then run:
 
-```bash
+```
 # 1. download
 curl -fsSL https://raw.githubusercontent.com/caiotomich/ssh-hardening-ubuntu/main/ssh-hardening.sh -o ssh-hardening.sh
 
@@ -53,7 +53,7 @@ Three separate commands on purpose. Chaining them with `&&` would defeat the poi
 
 **One-liner**, if you prefer:
 
-```bash
+```
 curl -fsSL https://raw.githubusercontent.com/caiotomich/ssh-hardening-ubuntu/main/ssh-hardening.sh \
   | sudo bash -s -- --force --safety-net 10
 ```
@@ -62,7 +62,7 @@ The `-s --` is required: without it bash treats `--force` as its own option rath
 
 **Or via git:**
 
-```bash
+```
 git clone https://github.com/caiotomich/ssh-hardening-ubuntu.git
 cd ssh-hardening-ubuntu
 sudo ./ssh-hardening.sh --safety-net 10
@@ -78,7 +78,7 @@ The other two reasons are the usual ones: you're running code as root without ha
 
 ### Verify integrity
 
-```bash
+```
 sha256sum ssh-hardening.sh
 ```
 
@@ -88,7 +88,7 @@ Compare against the value published in [CHECKSUMS.txt](CHECKSUMS.txt).
 
 ## Usage
 
-```bash
+```
 chmod +x ssh-hardening.sh
 
 sudo ./ssh-hardening.sh --dry-run          # see what would happen
@@ -101,14 +101,18 @@ sudo ./ssh-hardening.sh --safety-net 10    # apply with a safety net
 2. Run with `--safety-net 10`.
 3. **Without closing your current session**, open another terminal and test key-based access.
 4. Confirm passwords are blocked:
-   ```bash
-   ssh -o PubkeyAuthentication=no -o PreferredAuthentications=password user@ip
-   ```
-   You should get `Permission denied (publickey)`.
+
+```
+ssh -o PubkeyAuthentication=no -o PreferredAuthentications=password user@ip
+```
+
+You should get `Permission denied (publickey)`.
+
 5. All good? Cancel the automatic rollback:
-   ```bash
-   sudo systemctl stop ssh-hardening-rollback.timer
-   ```
+
+```
+sudo systemctl stop ssh-hardening-rollback.timer
+```
 
 If something goes wrong and you lose access, just wait out the 10 minutes — the server restores itself.
 
@@ -116,21 +120,21 @@ If something goes wrong and you lose access, just wait out the 10 minutes — th
 
 ## Options
 
-| Flag | Effect |
-|---|---|
-| `--dry-run` | Shows every action without performing any |
-| `--force` | Skips the interactive confirmation |
-| `--safety-net N` | Schedules an automatic backup restore in N minutes |
-| `--rollback DIR` | Restores a previous backup and reverts fail2ban |
-| `--skip-fail2ban` | Touches sshd only |
-| `--only-fail2ban` | Configures fail2ban only, leaves sshd alone |
-| `--ssh-mode MODE` | `normal`, `ddos`, `extra` or `aggressive` (default) |
-| `--allow-ip "IPs"` | IPs or ranges fail2ban must never ban |
-| `--disable-pam` | Applies `UsePAM no` (read the risks below first) |
-| `--enable-ufw` | Enables ufw with `default deny incoming` |
-| `--allow-port N` | Opens inbound TCP port N. Repeatable. Implies `--enable-ufw` |
-| `--docker-group [USER]` | Adds USER to the docker group (default: `$SUDO_USER`) |
-| `-h`, `--help` | Short help |
+| Flag                    | Effect                                                       |
+| ----------------------- | ------------------------------------------------------------ |
+| `--dry-run`             | Shows every action without performing any                    |
+| `--force`               | Skips the interactive confirmation                           |
+| `--safety-net N`        | Schedules an automatic backup restore in N minutes           |
+| `--rollback DIR`        | Restores a previous backup and reverts fail2ban              |
+| `--skip-fail2ban`       | Touches sshd only                                            |
+| `--only-fail2ban`       | Configures fail2ban only, leaves sshd alone                  |
+| `--ssh-mode MODE`       | `normal`, `ddos`, `extra` or `aggressive` (default)          |
+| `--allow-ip "IPs"`      | IPs or ranges fail2ban must never ban                        |
+| `--disable-pam`         | Applies `UsePAM no` (read the risks below first)             |
+| `--enable-ufw`          | Enables ufw with `default deny incoming`                     |
+| `--allow-port N`        | Opens inbound TCP port N. Repeatable. Implies `--enable-ufw` |
+| `--docker-group [USER]` | Adds USER to the docker group (default: `$SUDO_USER`)        |
+| `-h`, `--help`          | Short help                                                   |
 
 ---
 
@@ -162,7 +166,7 @@ UsePAM yes
 
 Off by default — enable it explicitly:
 
-```bash
+```
 # firewall with everything inbound denied except SSH
 sudo ./ssh-hardening.sh --enable-ufw --safety-net 10
 
@@ -185,7 +189,7 @@ Ports are opened for TCP only. For UDP or anything more specific, use `ufw allow
 
 ### Docker group
 
-```bash
+```
 sudo ./ssh-hardening.sh --docker-group          # adds the invoking user
 sudo ./ssh-hardening.sh --docker-group deploy   # adds a specific user
 ```
@@ -202,7 +206,7 @@ Membership applies to new sessions only — log out and back in.
 
 ### fail2ban configuration applied
 
-```ini
+```
 [DEFAULT]
 bantime   = 1h
 findtime  = 10m
@@ -256,7 +260,7 @@ There is a real PAM risk, but it's a different one: `UsePAM yes` combined with `
 
 **The `--disable-pam` flag exists anyway**, because some panel scanners treat `UsePAM yes` as a compliance failure and there's no middle ground — the directive is binary. If it's a requirement, use a safety net and test before closing your session:
 
-```bash
+```
 sudo ./ssh-hardening.sh --disable-pam --safety-net 10
 
 # in another terminal: a fresh key login must work
@@ -299,11 +303,11 @@ Docker writes its own rules into the `nat` table's `PREROUTING` chain, which is 
 
 Publish on loopback and put a reverse proxy in front:
 
-```bash
+```
 docker run -p 127.0.0.1:8080:80 ...
 ```
 
-```yaml
+```
 ports:
   - "127.0.0.1:8080:80"
 ```
@@ -328,7 +332,7 @@ It's the default because that's what scanners ask for, but calibrate your expect
 
 The risk runs the other way. If a load balancer health check or monitoring probe touches the SSH port, aggressive mode will ban your own infrastructure. In that case:
 
-```bash
+```
 sudo ./ssh-hardening.sh --ssh-mode normal
 # or
 sudo ./ssh-hardening.sh --allow-ip "10.0.0.0/8"
@@ -338,7 +342,7 @@ sudo ./ssh-hardening.sh --allow-ip "10.0.0.0/8"
 
 ## Manual verification
 
-```bash
+```
 # effective sshd values (not what's written in the files)
 sudo sshd -T | grep -Ei "passwordauth|kbdinteractive|usepam|pubkeyauth|permitroot"
 
@@ -364,7 +368,8 @@ A healthy state: `passwordauthentication no`, `kbdinteractiveauthentication no`,
 **My own fail2ban banned me** — get in through your provider's web/VNC console and run `fail2ban-client set sshd unbanip YOUR.IP`. Then add your IP with `--allow-ip`.
 
 **My SSH client gets banned on connect** — if your agent offers several keys, `MaxAuthTries` (default 6) is exceeded and each attempt counts as a failure. Force a single key:
-```bash
+
+```
 ssh -o IdentitiesOnly=yes -i ~/.ssh/your_key user@ip
 ```
 
@@ -374,17 +379,18 @@ ssh -o IdentitiesOnly=yes -i ~/.ssh/your_key user@ip
 
 **`docker` command says permission denied after `--docker-group`** — group membership is resolved at login. Log out and back in, or run `newgrp docker` for the current shell.
 
+**I lost access completely** — use your provider's web/VNC console (DigitalOcean, Hetzner, Contabo and others all offer one). It logs you in with a local password, independent of SSH, and you can run `sudo ./ssh-hardening.sh --rollback /root/ssh-backup-*`.
+
 **A service stopped responding after enabling ufw** — expected. Everything inbound is denied except SSH and whatever you passed to `--allow-port`. Open what you need:
-```bash
+
+```
 sudo ufw allow 3306/tcp
 sudo ufw status verbose
 ```
 
-**I lost access completely** — use your provider's web/VNC console (DigitalOcean, Hetzner, Contabo and others all offer one). It logs you in with a local password, independent of SSH, and you can run `sudo ./ssh-hardening.sh --rollback /root/ssh-backup-*`.
-
 **The panel scanner still flags an alert** — check the real state first:
 
-```bash
+```
 sudo sshd -T | grep -Ei 'passwordauth|usepam|kbdinteractive'
 sudo fail2ban-client status sshd
 ```
@@ -395,11 +401,37 @@ If those show the correct values, the server is fine and the problem is the pane
 
 ## Reverting
 
-```bash
+```
 sudo ./ssh-hardening.sh --rollback /root/ssh-backup-YYYYMMDD-HHMMSS
 ```
 
 Restores the SSH configuration, removes the jail it created, unbans every IP and restarts both services. If the script was the one that enabled ufw, the firewall is disabled too; a ufw that predates the run is left alone. Packages stay installed.
+
+---
+
+## Development
+
+Run the test suite:
+
+```
+sudo bash tests/run.sh
+```
+
+Root is required because the script refuses to run as anyone else, and the end-to-end test executes it for real in `--dry-run` mode. External tools — `sshd`, `ufw`, `systemctl`, `fail2ban-*`, `apt-get` — are stubbed in `tests/stubs/` and intercepted through `PATH`, so nothing on the machine running the tests is touched.
+
+The suite covers argument parsing, the post-parse validation, authorized-key detection, and a full `--dry-run` pass over the ufw and fail2ban sections. Two of its assertions are unusual and deliberate:
+
+- One asserts that `(( x++ ))` returns a non-zero status when `x` is 0. That is not a bash lesson — it is the reason key counting uses `total_keys=$(( total_keys + 1 ))`. Under `set -e` the shorter form aborted the script mid-check, with no message, whenever the only key lived in a central `AuthorizedKeysFile`.
+
+- One asserts the *wrong* behaviour on purpose: a key preceded by options (`from="..."`, `command="..."`, `restrict,...`) is currently not counted. The test documents the gap and will fail the day it is fixed, which is when it should be updated.
+
+### `SSH_HARDENING_SOURCE_ONLY`
+
+An environment variable, not a flag, and not something you need for normal use. The test suite sets it to load the script's functions without running anything.
+
+It exists because the usual idiom for this — comparing `BASH_SOURCE` against `$0` — breaks the piped install: under `curl | bash` there is no `BASH_SOURCE`, and the comparison would make the script silently do nothing in exactly the mode documented above. Opting in through the environment keeps that path working.
+
+If the variable ever leaks into a real run, the script exits without touching the system. That is the only thing it can do.
 
 ---
 

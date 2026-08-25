@@ -1,0 +1,24 @@
+name: tests
+
+on: [push, pull_request]
+
+jobs:
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Syntax check
+        run: |
+          bash -n ssh-hardening.sh
+          for f in tests/*.sh; do bash -n "$f"; done
+
+      - name: ShellCheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          shellcheck -S warning ssh-hardening.sh tests/*.sh
+
+      - name: Test suite
+        # The dry-run test needs uid 0: the script refuses to run otherwise.
+        run: sudo bash tests/run.sh

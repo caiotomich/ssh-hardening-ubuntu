@@ -1,0 +1,2 @@
+#!/bin/sh
+echo "Fail2Ban v1.0.2"

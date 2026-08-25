@@ -80,7 +80,19 @@ else
     readonly PIPED=1
 fi
 
+# Same as run(), but silences the real command's stdout. Needed where the
+# tool is chatty in normal use: putting '>/dev/null' on the run() call site
+# would also swallow the '(dry-run)' line and make --dry-run print nothing.
+run_quiet() {
+    if (( DRY_RUN )); then
+        printf '  %s(dry-run)%s %s\n' "$c_yel" "$c_off" "$*"
+    else
+        "$@" >/dev/null
+    fi
+}
+
 # ---------- arguments ----------
+parse_args() {
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --dry-run)    DRY_RUN=1; shift ;;
@@ -109,19 +121,25 @@ while [[ $# -gt 0 ]]; do
         *)            die "unknown option: $1" ;;
     esac
 done
+}
 
-[[ $EUID -eq 0 ]] || die "must run as root (sudo $SELF_LABEL)"
-[[ "$SSH_MODE" =~ ^(normal|ddos|extra|aggressive)$ ]] || die "invalid --ssh-mode: $SSH_MODE"
+# Everything that has to hold true once the flags are in. Kept separate from
+# parse_args so both can be exercised without running the script; PR 2 adds
+# the missing checks (--safety-net, --allow-ip, --rollback) here.
+validate_args() {
+    [[ "$SSH_MODE" =~ ^(normal|ddos|extra|aggressive)$ ]] || die "invalid --ssh-mode: $SSH_MODE"
 
-# --allow-port on its own is meaningless: without ufw enabled there is no
-# firewall to open a port in. Treat it as implying --enable-ufw.
-if [[ -n "$UFW_PORTS" ]]; then
-    for _p in $UFW_PORTS; do
-        [[ "$_p" =~ ^[0-9]+$ ]] && (( _p >= 1 && _p <= 65535 )) \
-            || die "invalid --allow-port value: $_p"
-    done
-    (( ENABLE_UFW )) || { ENABLE_UFW=1; info "--allow-port implies --enable-ufw"; }
-fi
+    # --allow-port on its own is meaningless: without ufw enabled there is no
+    # firewall to open a port in. Treat it as implying --enable-ufw.
+    if [[ -n "$UFW_PORTS" ]]; then
+        local _p
+        for _p in $UFW_PORTS; do
+            [[ "$_p" =~ ^[0-9]+$ ]] && (( _p >= 1 && _p <= 65535 )) \
+                || die "invalid --allow-port value: $_p"
+        done
+        (( ENABLE_UFW )) || { ENABLE_UFW=1; info "--allow-port implies --enable-ufw"; }
+    fi
+}
 
 # Find the IP you are connected from, so you never ban yourself.
 # Note: sudo clears SSH_CLIENT by default (env_reset), hence the fallbacks.
@@ -133,6 +151,60 @@ detect_client_ip() {
     [[ -z "$ip" ]] && ip=$(last -w -i -n1 "${SUDO_USER:-root}" 2>/dev/null | awk 'NR==1{print $3}')
     [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$|^[0-9a-fA-F:]+:[0-9a-fA-F:]+$ ]] && printf '%s' "$ip"
 }
+
+# ---------- authorized key detection ----------
+# Both functions populate the globals users_with_keys[] and total_keys.
+# scan_authorized_keys RESETS them and reads home directories from stdin;
+# scan_central_authorized_keys only APPENDS, so it must run second.
+
+scan_authorized_keys() {
+    users_with_keys=()
+    total_keys=0
+    local home ak n user
+    while IFS= read -r home; do
+        ak="$home/.ssh/authorized_keys"
+        [[ -s "$ak" ]] || continue
+        n=$(grep -cE '^[[:space:]]*(ssh-|ecdsa-|sk-)' "$ak" || true)
+        (( n > 0 )) || continue
+        user=$(basename "$home"); [[ "$home" == "/root" ]] && user="root"
+        users_with_keys+=("$user ($n key(s))")
+        total_keys=$(( total_keys + n ))
+    done
+}
+
+# Covers a custom AuthorizedKeysFile pointing at a central location.
+scan_central_authorized_keys() {
+    local akf pat
+    # 'sshd -T' failing must not abort: with pipefail its status wins the
+    # pipeline, so absorb it explicitly.
+    akf=$(sshd -T 2>/dev/null | awk '/^authorizedkeysfile /{$1=""; print}') || akf=""
+    for pat in $akf; do
+        [[ "$pat" == *%u* || "$pat" == .ssh/* ]] && continue
+        if [[ -s "$pat" ]]; then
+            users_with_keys+=("$pat (central file)")
+            # NOT (( total_keys++ )): post-increment evaluates to the OLD
+            # value, so it returns status 1 when total_keys is 0 and errexit
+            # kills the script mid-check, silently.
+            total_keys=$(( total_keys + 1 ))
+        fi
+    done
+}
+
+# ---------- sourcing guard ----------
+# The test suite sources this file to call the functions above in isolation.
+# Opt-in through the environment rather than comparing BASH_SOURCE to $0:
+# under 'curl | bash' BASH_SOURCE is unset, and that comparison would make
+# the script silently do nothing in exactly the mode the README documents.
+# Worst case if the variable leaks into a real run: the script exits without
+# touching anything.
+if [[ -n "${SSH_HARDENING_SOURCE_ONLY:-}" ]]; then
+    return 0 2>/dev/null || exit 0
+fi
+
+parse_args "$@"
+validate_args
+
+[[ $EUID -eq 0 ]] || die "must run as root (sudo $SELF_LABEL)"
 
 # ---------- manual rollback ----------
 if [[ -n "${ROLLBACK_DIR:-}" ]]; then
@@ -175,23 +247,8 @@ info "Looking for authorized public keys..."
 declare -a users_with_keys=()
 total_keys=0
 
-while IFS= read -r home; do
-    ak="$home/.ssh/authorized_keys"
-    [[ -s "$ak" ]] || continue
-    n=$(grep -cE '^[[:space:]]*(ssh-|ecdsa-|sk-)' "$ak" || true)
-    (( n > 0 )) || continue
-    user=$(basename "$home"); [[ "$home" == "/root" ]] && user="root"
-    users_with_keys+=("$user ($n key(s))")
-    (( total_keys += n ))
-done < <(printf '%s\n' /root /home/*)
-
-# also covers a custom AuthorizedKeysFile in a central location
-if akf=$(sshd -T 2>/dev/null | awk '/^authorizedkeysfile /{$1=""; print}'); then
-    for pat in $akf; do
-        [[ "$pat" == *%u* || "$pat" == .ssh/* ]] && continue
-        [[ -s "$pat" ]] && { users_with_keys+=("$pat (central file)"); (( total_keys++ )); }
-    done
-fi
+scan_authorized_keys < <(printf '%s\n' /root /home/*)
+scan_central_authorized_keys
 
 if (( total_keys == 0 )); then
     die "No public key found. Run 'ssh-copy-id user@server' from your local
@@ -469,16 +526,16 @@ setup_ufw() {
     # instant lockout of every session that isn't already open.
     for p in $ssh_ports; do
         info "  allowing SSH on ${p}/tcp"
-        run ufw allow "${p}/tcp" comment 'SSH - ssh-hardening.sh' >/dev/null
+        run_quiet ufw allow "${p}/tcp" comment 'SSH - ssh-hardening.sh'
     done
 
     for p in $UFW_PORTS; do
         info "  allowing inbound ${p}/tcp"
-        run ufw allow "${p}/tcp" comment 'ssh-hardening.sh' >/dev/null
+        run_quiet ufw allow "${p}/tcp" comment 'ssh-hardening.sh'
     done
 
-    run ufw default deny incoming >/dev/null
-    run ufw default allow outgoing >/dev/null
+    run_quiet ufw default deny incoming
+    run_quiet ufw default allow outgoing
 
     if (( DRY_RUN )); then
         printf '  %s(dry-run)%s would run: ufw --force enable\n' "$c_yel" "$c_off"
