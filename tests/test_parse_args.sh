@@ -67,7 +67,7 @@ out=$(
         printf "DOCKER_USER=[%s]" "$DOCKER_USER"
     ' _ "$SCRIPT" 2>&1
 )
-assert_eq "docker: no sudo leaves it empty (PR3 changes this)" "DOCKER_USER=[]" "$out"
+assert_eq "docker: no sudo falls back to root" "DOCKER_USER=[root]" "$out"
 
 out=$(SUDO_USER=caio parse --docker-group deploy)
 assert_eq "docker: explicit user" "deploy" "$(field DOCKER_USER "$out")"

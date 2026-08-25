@@ -19,7 +19,7 @@
 #   --disable-pam              set UsePAM no (see the risks in the README)
 #   --enable-ufw               enable ufw with default deny incoming
 #   --allow-port 443           open an inbound TCP port (repeatable)
-#   --docker-group [USER]      add USER (default: $SUDO_USER) to the docker group
+#   --docker-group [USER]      add USER (default: $SUDO_USER, root without sudo)
 #
 # The safety net schedules an automatic restore of the backup. Test your
 # access, then cancel the timer with the command printed at the end.
@@ -49,7 +49,10 @@ PAM_VALUE="yes"
 ENABLE_UFW=0
 UFW_PORTS=""
 DOCKER_GROUP=0
-DOCKER_USER="${SUDO_USER:-}"
+# Without sudo there is no invoking user, so root is the fallback. See
+# setup_docker_group: for uid 0 this is recorded but grants nothing.
+DOCKER_USER="${SUDO_USER:-root}"
+DOCKER_USER_EXPLICIT=0
 readonly UFW_MARKER_NAME="ufw-enabled-by-script"
 
 # ---------- output ----------
@@ -91,6 +94,30 @@ run_quiet() {
     fi
 }
 
+# Asks a yes/no question. Returns 0 for yes, 1 for no, 2 when there is no way
+# to ask (callers decide whether that is fatal).
+#
+# Under 'curl | bash' stdin IS the script itself: a plain 'read' would consume
+# lines of code as if they were the answer. Hence /dev/tty.
+confirm() {   # confirm <prompt>
+    local resp=""
+    # Testing '-r /dev/tty' is not enough: it only checks permission bits.
+    # With no controlling terminal (cron, a systemd unit, 'ssh host sudo ...',
+    # CI) the device is there and readable, but opening it fails with ENXIO -
+    # and the old code then hit 'resp: unbound variable' under set -u instead
+    # of printing the guidance. Try to open it for real.
+    if { : >/dev/tty; } 2>/dev/null; then
+        printf '\n%s%s [y/N]%s ' "$c_yel" "$1" "$c_off" > /dev/tty
+        read -r resp < /dev/tty || return 2
+    elif (( PIPED )); then
+        return 2
+    else
+        printf '\n%s%s [y/N]%s ' "$c_yel" "$1" "$c_off"
+        read -r resp || return 2
+    fi
+    [[ "$resp" =~ ^[yYsS]$ ]]
+}
+
 # ---------- arguments ----------
 parse_args() {
 while [[ $# -gt 0 ]]; do
@@ -109,7 +136,9 @@ while [[ $# -gt 0 ]]; do
         --docker-group)
             DOCKER_GROUP=1
             # optional username: consume it only if it isn't another flag
-            if [[ -n "${2:-}" && "$2" != -* ]]; then DOCKER_USER="$2"; shift 2; else shift; fi
+            if [[ -n "${2:-}" && "$2" != -* ]]; then
+                DOCKER_USER="$2"; DOCKER_USER_EXPLICIT=1; shift 2
+            else shift; fi
             ;;
         -h|--help)
             if (( PIPED )); then
@@ -269,19 +298,15 @@ sshd -T 2>/dev/null | grep -Ei '^(passwordauthentication|kbdinteractiveauthentic
 
 # ---------- 3. confirm ----------
 if (( ! FORCE && ! DRY_RUN )); then
-    # Under 'curl | bash', stdin IS the script itself: a plain 'read'
-    # would consume lines of code as if they were your answer.
-    if [[ -r /dev/tty ]]; then
-        printf '\n%sDisable password authentication now? [y/N]%s ' "$c_yel" "$c_off" > /dev/tty
-        read -r resp < /dev/tty
-    elif (( PIPED )); then
-        die "No terminal to confirm on. Use --force, or download the script first:
-       curl -fsSL $RAW_URL -o ssh-hardening.sh && sudo bash ssh-hardening.sh"
-    else
-        printf '\n%sDisable password authentication now? [y/N]%s ' "$c_yel" "$c_off"
-        read -r resp
-    fi
-    [[ "$resp" =~ ^[yYsS]$ ]] || { info "Cancelled."; exit 0; }
+    # Not 'case $?': a function returning non-zero would trip errexit before
+    # the case is ever evaluated.
+    _ans=0; confirm "Disable password authentication now?" || _ans=$?
+    case $_ans in
+        0) : ;;
+        1) info "Cancelled."; exit 0 ;;
+        2) die "No terminal to confirm on. Use --force, or download the script first:
+       curl -fsSL $RAW_URL -o ssh-hardening.sh && sudo bash ssh-hardening.sh" ;;
+    esac
 fi
 
 # ---------- 4. backup ----------
@@ -457,17 +482,6 @@ fi   # <-- end of the sshd block (--only-fail2ban skips everything above)
 setup_docker_group() {
     local u="$DOCKER_USER"
 
-    if [[ -z "$u" ]]; then
-        warn "  could not tell which user to add (SUDO_USER is empty)."
-        warn "  Pass it explicitly: --docker-group USERNAME"
-        return 1
-    fi
-
-    if [[ "$u" == "root" ]]; then
-        warn "  root already has full access - nothing to do"
-        return 1
-    fi
-
     id -u "$u" >/dev/null 2>&1 || { warn "  no such user: $u"; return 1; }
 
     if ! getent group docker >/dev/null 2>&1; then
@@ -476,9 +490,33 @@ setup_docker_group() {
         return 1
     fi
 
+    # Compared by UID, not by the string "root": an alias account with uid 0
+    # (toor and friends) is the same thing and used to slip through silently.
+    if (( $(id -u "$u") == 0 )); then
+        warn "  $u has uid 0 - it already reaches the docker socket through"
+        warn "  CAP_DAC_OVERRIDE, so this group membership grants it nothing"
+        warn "  to give a regular user access: --docker-group USERNAME"
+    fi
+
     if id -nG "$u" 2>/dev/null | tr ' ' '\n' | grep -qx docker; then
         ok "  $u is already in the docker group"
         return 0
+    fi
+
+    # This is the only step in the script that GRANTS privilege rather than
+    # removing it, and the docker group is root-equivalent. When the target
+    # came from $SUDO_USER instead of an explicit argument, say so and ask.
+    if (( ! DOCKER_USER_EXPLICIT && ! FORCE && ! DRY_RUN )); then
+        warn "  about to grant root-equivalent access to '$u' (from \$SUDO_USER)"
+        local _ans=0
+        confirm "  Add $u to the docker group?" || _ans=$?
+        case $_ans in
+            0) : ;;
+            1) info "  skipped"; return 0 ;;
+            2) warn "  no terminal to confirm on - skipping"
+               warn "  re-run with --docker-group $u to be explicit"
+               return 0 ;;
+        esac
     fi
 
     run usermod -aG docker "$u"
